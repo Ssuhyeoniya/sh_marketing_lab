@@ -339,7 +339,8 @@ export default function IphoneMockup() {
 
       {frameMode === 'png' && customFrame && showRectEditor && (
         <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <b style={{ fontSize: 12 }}>PNG 프레임 화면 영역 (이미지가 들어갈 위치)</b>
+          <b style={{ fontSize: 12 }}>이미지 영역</b>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>프리뷰에서 모서리·변을 드래그해 크기 조절</span>
           <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
             X <input type="number" value={Math.round(customFrame.screenRect.x)} onChange={(e) => updateScreenRect({ x: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
           </label>
@@ -440,10 +441,7 @@ export default function IphoneMockup() {
                 item={active}
                 frameMode={frameMode}
                 customFrame={customFrame}
-                onLayerMove={(lid, dx, dy) => {
-                  const l = active.textLayers.find((x) => x.id === lid);
-                  if (l) updateLayer(lid, { x: l.x + dx, y: l.y + dy });
-                }}
+                onScreenRectChange={(r) => updateScreenRect(r)}
               />
             ) : (
               <div className="empty-hero">
@@ -683,28 +681,132 @@ function FrameUploadButton({ onUpload, active }) {
   );
 }
 
-function PreviewArea({ item, frameMode, customFrame }) {
+function PreviewArea({ item, frameMode, customFrame, onScreenRectChange }) {
   const ref = useRef(null);
   useEffect(() => {
     if (!ref.current) return;
     drawPreview(ref.current, item, frameMode, customFrame);
   }, [item, frameMode, customFrame]);
 
-  const previewScale = 0.55; // display scale only
-  const w = (frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W) * previewScale;
-  const h = (frameMode === 'svg' ? FRAME_H : customFrame?.canvas.height || FRAME_H) * previewScale;
+  const previewScale = 0.55;
+  const frameW = frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W;
+  const frameH = frameMode === 'svg' ? FRAME_H : customFrame?.canvas.height || FRAME_H;
+  const dispW = frameW * previewScale;
+  const dispH = frameH * previewScale;
 
   return (
-    <canvas
-      ref={ref}
-      width={frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W}
-      height={frameMode === 'svg' ? FRAME_H : customFrame?.canvas.height || FRAME_H}
-      style={{
-        width: w,
-        height: h,
-        filter: 'drop-shadow(0 12px 32px rgba(0,0,0,0.18))',
-      }}
-    />
+    <div style={{ position: 'relative', display: 'inline-block' }}>
+      <canvas
+        ref={ref}
+        width={frameW}
+        height={frameH}
+        style={{
+          width: dispW,
+          height: dispH,
+          display: 'block',
+          filter: 'drop-shadow(0 12px 32px rgba(0,0,0,0.18))',
+        }}
+      />
+      {frameMode === 'png' && customFrame && onScreenRectChange && (
+        <ResizeOverlay
+          rect={customFrame.screenRect}
+          frameW={frameW}
+          frameH={frameH}
+          scale={previewScale}
+          onChange={onScreenRectChange}
+        />
+      )}
+    </div>
+  );
+}
+
+function ResizeOverlay({ rect, frameW, frameH, scale, onChange }) {
+  const [drag, setDrag] = useState(null);
+
+  const begin = (handle) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDrag({ handle, sx: e.clientX, sy: e.clientY, orig: { ...rect } });
+  };
+
+  useEffect(() => {
+    if (!drag) return;
+    const onMove = (e) => {
+      const dx = (e.clientX - drag.sx) / scale;
+      const dy = (e.clientY - drag.sy) / scale;
+      let { x, y, w, h } = drag.orig;
+      const H = drag.handle;
+      if (H === 'move') { x += dx; y += dy; }
+      if (H.includes('n')) { y += dy; h -= dy; }
+      if (H.includes('s')) { h += dy; }
+      if (H.includes('w')) { x += dx; w -= dx; }
+      if (H.includes('e')) { w += dx; }
+      // Min size
+      if (w < 20) { if (H.includes('w')) x = drag.orig.x + drag.orig.w - 20; w = 20; }
+      if (h < 20) { if (H.includes('n')) y = drag.orig.y + drag.orig.h - 20; h = 20; }
+      // Clamp inside frame
+      x = Math.max(0, Math.min(x, frameW - w));
+      y = Math.max(0, Math.min(y, frameH - h));
+      w = Math.min(w, frameW - x);
+      h = Math.min(h, frameH - y);
+      onChange({ x, y, w, h });
+    };
+    const onUp = () => setDrag(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [drag, scale, frameW, frameH, onChange]);
+
+  const rx = rect.x * scale, ry = rect.y * scale;
+  const rw = rect.w * scale, rh = rect.h * scale;
+
+  const handles = [
+    { id: 'nw', x: rx, y: ry, cur: 'nwse-resize' },
+    { id: 'n', x: rx + rw / 2, y: ry, cur: 'ns-resize' },
+    { id: 'ne', x: rx + rw, y: ry, cur: 'nesw-resize' },
+    { id: 'w', x: rx, y: ry + rh / 2, cur: 'ew-resize' },
+    { id: 'e', x: rx + rw, y: ry + rh / 2, cur: 'ew-resize' },
+    { id: 'sw', x: rx, y: ry + rh, cur: 'nesw-resize' },
+    { id: 's', x: rx + rw / 2, y: ry + rh, cur: 'ns-resize' },
+    { id: 'se', x: rx + rw, y: ry + rh, cur: 'nwse-resize' },
+  ];
+
+  return (
+    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+      <div
+        onMouseDown={begin('move')}
+        title="드래그로 이동"
+        style={{
+          position: 'absolute',
+          left: rx, top: ry, width: rw, height: rh,
+          cursor: drag?.handle === 'move' ? 'grabbing' : 'move',
+          pointerEvents: 'auto',
+          border: '2px dashed #3b82f6',
+          boxSizing: 'border-box',
+          background: 'rgba(59,130,246,0.04)',
+        }}
+      />
+      {handles.map((h) => (
+        <div
+          key={h.id}
+          onMouseDown={begin(h.id)}
+          style={{
+            position: 'absolute',
+            left: h.x - 6, top: h.y - 6,
+            width: 12, height: 12,
+            background: '#fff',
+            border: '2px solid #3b82f6',
+            borderRadius: 2,
+            cursor: h.cur,
+            pointerEvents: 'auto',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.15)',
+          }}
+        />
+      ))}
+    </div>
   );
 }
 
@@ -752,11 +854,5 @@ async function drawPreview(canvas, item, frameMode, customFrame) {
     const { x, y, w, h } = customFrame.screenRect;
     ctx.drawImage(screen, 0, 0, SCREEN_W, SCREEN_H, x, y, w, h);
     ctx.drawImage(customFrame.canvas, 0, 0);
-    // Outline so user can see where screen area is.
-    ctx.strokeStyle = '#3b82f6';
-    ctx.lineWidth = 3;
-    ctx.setLineDash([8, 6]);
-    ctx.strokeRect(x, y, w, h);
-    ctx.setLineDash([]);
   }
 }
