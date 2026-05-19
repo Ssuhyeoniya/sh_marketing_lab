@@ -26,6 +26,7 @@ export default function IphoneMockup() {
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState('');
   const [showRectEditor, setShowRectEditor] = useState(false);
+  const [aspectLocked, setAspectLocked] = useState(true);
 
   const active = items.find((i) => i.id === activeId);
   const step = items.length === 0 ? 0 : !active?.ocrDone ? 1 : 2;
@@ -79,7 +80,8 @@ export default function IphoneMockup() {
     const ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0);
     const rect = detectTransparentRect(ctx, canvas.width, canvas.height);
-    setCustomFrame({ canvas, screenRect: rect });
+    const anchors = detectFrameAnchors(canvas);
+    setCustomFrame({ canvas, screenRect: rect, anchors });
     setFrameMode('png');
     setShowRectEditor(true);
     showToast('프레임 업로드 완료. 화면 영역을 확인·조정하세요.');
@@ -340,21 +342,67 @@ export default function IphoneMockup() {
       {frameMode === 'png' && customFrame && showRectEditor && (
         <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <b style={{ fontSize: 12 }}>이미지 영역</b>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>프리뷰에서 모서리·변을 드래그해 크기 조절</span>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>핸들 드래그로 조절 · Shift = 비율 잠금 반전</span>
           <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-            X <input type="number" value={Math.round(customFrame.screenRect.x)} onChange={(e) => updateScreenRect({ x: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
+            W
+            <input
+              type="number"
+              value={Math.round(customFrame.screenRect.w)}
+              onChange={(e) => {
+                const nw = Math.max(20, +e.target.value);
+                if (aspectLocked) {
+                  const ratio = customFrame.screenRect.h / customFrame.screenRect.w;
+                  updateScreenRect({ w: nw, h: Math.max(20, Math.round(nw * ratio)) });
+                } else {
+                  updateScreenRect({ w: nw });
+                }
+              }}
+              style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }}
+            />
           </label>
+          <button
+            className="btn sm"
+            onClick={() => setAspectLocked((v) => !v)}
+            title="가로·세로 비율 잠금"
+            style={{
+              padding: '4px 8px',
+              background: aspectLocked ? 'var(--primary)' : '#fff',
+              color: aspectLocked ? '#fff' : 'var(--text)',
+              borderColor: aspectLocked ? 'var(--primary)' : 'var(--border)',
+              fontSize: 11,
+            }}
+          >
+            {aspectLocked ? '🔒 비율' : '🔓 자유'}
+          </button>
           <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-            Y <input type="number" value={Math.round(customFrame.screenRect.y)} onChange={(e) => updateScreenRect({ y: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
+            H
+            <input
+              type="number"
+              value={Math.round(customFrame.screenRect.h)}
+              onChange={(e) => {
+                const nh = Math.max(20, +e.target.value);
+                if (aspectLocked) {
+                  const ratio = customFrame.screenRect.w / customFrame.screenRect.h;
+                  updateScreenRect({ h: nh, w: Math.max(20, Math.round(nh * ratio)) });
+                } else {
+                  updateScreenRect({ h: nh });
+                }
+              }}
+              style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }}
+            />
           </label>
-          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-            W <input type="number" value={Math.round(customFrame.screenRect.w)} onChange={(e) => updateScreenRect({ w: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
-          </label>
-          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-            H <input type="number" value={Math.round(customFrame.screenRect.h)} onChange={(e) => updateScreenRect({ h: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
-          </label>
-          <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>프레임 크기: {customFrame.canvas.width}×{customFrame.canvas.height}</span>
-          <button className="btn sm" onClick={() => updateScreenRect(detectTransparentRect(customFrame.canvas.getContext('2d'), customFrame.canvas.width, customFrame.canvas.height))}>자동 재감지</button>
+          <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>
+            프레임 {customFrame.canvas.width}×{customFrame.canvas.height} · 가이드 {(customFrame.anchors?.xs.length || 0) + (customFrame.anchors?.ys.length || 0)}개
+          </span>
+          <button
+            className="btn sm"
+            onClick={() => {
+              const r = detectTransparentRect(customFrame.canvas.getContext('2d'), customFrame.canvas.width, customFrame.canvas.height);
+              updateScreenRect(r);
+            }}
+          >
+            자동 재감지
+          </button>
         </div>
       )}
 
@@ -441,6 +489,7 @@ export default function IphoneMockup() {
                 item={active}
                 frameMode={frameMode}
                 customFrame={customFrame}
+                aspectLocked={aspectLocked}
                 onScreenRectChange={(r) => updateScreenRect(r)}
               />
             ) : (
@@ -681,7 +730,7 @@ function FrameUploadButton({ onUpload, active }) {
   );
 }
 
-function PreviewArea({ item, frameMode, customFrame, onScreenRectChange }) {
+function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectChange }) {
   const ref = useRef(null);
   useEffect(() => {
     if (!ref.current) return;
@@ -713,6 +762,8 @@ function PreviewArea({ item, frameMode, customFrame, onScreenRectChange }) {
           frameW={frameW}
           frameH={frameH}
           scale={previewScale}
+          aspectLocked={aspectLocked}
+          anchors={customFrame.anchors}
           onChange={onScreenRectChange}
         />
       )}
@@ -720,13 +771,20 @@ function PreviewArea({ item, frameMode, customFrame, onScreenRectChange }) {
   );
 }
 
-function ResizeOverlay({ rect, frameW, frameH, scale, onChange }) {
+const SNAP_THRESHOLD = 6; // pixels in frame coords
+
+function ResizeOverlay({ rect, frameW, frameH, scale, aspectLocked, anchors, onChange }) {
   const [drag, setDrag] = useState(null);
+  const [guides, setGuides] = useState({ x: [], y: [] });
+
+  // Effective snap targets = frame edges + frame center + detected anchors
+  const xTargets = [0, frameW / 2, frameW, ...(anchors?.xs || [])];
+  const yTargets = [0, frameH / 2, frameH, ...(anchors?.ys || [])];
 
   const begin = (handle) => (e) => {
     e.preventDefault();
     e.stopPropagation();
-    setDrag({ handle, sx: e.clientX, sy: e.clientY, orig: { ...rect } });
+    setDrag({ handle, sx: e.clientX, sy: e.clientY, orig: { ...rect }, shift: e.shiftKey });
   };
 
   useEffect(() => {
@@ -734,31 +792,77 @@ function ResizeOverlay({ rect, frameW, frameH, scale, onChange }) {
     const onMove = (e) => {
       const dx = (e.clientX - drag.sx) / scale;
       const dy = (e.clientY - drag.sy) / scale;
-      let { x, y, w, h } = drag.orig;
       const H = drag.handle;
-      if (H === 'move') { x += dx; y += dy; }
-      if (H.includes('n')) { y += dy; h -= dy; }
-      if (H.includes('s')) { h += dy; }
-      if (H.includes('w')) { x += dx; w -= dx; }
-      if (H.includes('e')) { w += dx; }
-      // Min size
+      // Shift toggles aspect lock
+      const effLock = e.shiftKey ? !aspectLocked : aspectLocked;
+      let { x, y, w, h } = drag.orig;
+      const aspect = drag.orig.w / drag.orig.h;
+
+      if (H === 'move') {
+        x += dx; y += dy;
+      } else if (effLock && ['nw', 'ne', 'sw', 'se'].includes(H)) {
+        // Corner with aspect lock: drive by dx, derive dy
+        let dwSign = H.includes('e') ? 1 : -1;
+        let nw = drag.orig.w + dwSign * dx;
+        if (nw < 20) nw = 20;
+        let nh = nw / aspect;
+        if (H.includes('w')) x = drag.orig.x + (drag.orig.w - nw);
+        if (H.includes('n')) y = drag.orig.y + (drag.orig.h - nh);
+        w = nw; h = nh;
+      } else if (effLock && ['n', 's'].includes(H)) {
+        // Vertical edge with aspect lock — center-anchored horizontally
+        let nh = H === 's' ? drag.orig.h + dy : drag.orig.h - dy;
+        if (nh < 20) nh = 20;
+        let nw = nh * aspect;
+        x = drag.orig.x + (drag.orig.w - nw) / 2;
+        if (H === 'n') y = drag.orig.y + (drag.orig.h - nh);
+        w = nw; h = nh;
+      } else if (effLock && ['e', 'w'].includes(H)) {
+        let nw = H === 'e' ? drag.orig.w + dx : drag.orig.w - dx;
+        if (nw < 20) nw = 20;
+        let nh = nw / aspect;
+        y = drag.orig.y + (drag.orig.h - nh) / 2;
+        if (H === 'w') x = drag.orig.x + (drag.orig.w - nw);
+        w = nw; h = nh;
+      } else {
+        // Free resize
+        if (H.includes('n')) { y += dy; h -= dy; }
+        if (H.includes('s')) { h += dy; }
+        if (H.includes('w')) { x += dx; w -= dx; }
+        if (H.includes('e')) { w += dx; }
+      }
+
+      // Min size guard
       if (w < 20) { if (H.includes('w')) x = drag.orig.x + drag.orig.w - 20; w = 20; }
       if (h < 20) { if (H.includes('n')) y = drag.orig.y + drag.orig.h - 20; h = 20; }
-      // Clamp inside frame
+
+      // Snap to anchors
+      const activeGuides = { x: [], y: [] };
+      const snap = computeSnap(H, { x, y, w, h }, xTargets, yTargets, SNAP_THRESHOLD);
+      x = snap.x; y = snap.y; w = snap.w; h = snap.h;
+      activeGuides.x = snap.guideX;
+      activeGuides.y = snap.guideY;
+
+      // Clamp to frame
       x = Math.max(0, Math.min(x, frameW - w));
       y = Math.max(0, Math.min(y, frameH - h));
       w = Math.min(w, frameW - x);
       h = Math.min(h, frameH - y);
+
+      setGuides(activeGuides);
       onChange({ x, y, w, h });
     };
-    const onUp = () => setDrag(null);
+    const onUp = () => {
+      setDrag(null);
+      setGuides({ x: [], y: [] });
+    };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [drag, scale, frameW, frameH, onChange]);
+  }, [drag, scale, frameW, frameH, aspectLocked, anchors, onChange]);
 
   const rx = rect.x * scale, ry = rect.y * scale;
   const rw = rect.w * scale, rh = rect.h * scale;
@@ -776,9 +880,25 @@ function ResizeOverlay({ rect, frameW, frameH, scale, onChange }) {
 
   return (
     <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+      {/* Snap guide lines */}
+      {guides.x.map((gx, i) => (
+        <div key={'gx' + i} style={{
+          position: 'absolute', left: gx * scale - 0.5, top: 0,
+          width: 1, height: frameH * scale,
+          background: '#ef4444', pointerEvents: 'none',
+        }} />
+      ))}
+      {guides.y.map((gy, i) => (
+        <div key={'gy' + i} style={{
+          position: 'absolute', left: 0, top: gy * scale - 0.5,
+          width: frameW * scale, height: 1,
+          background: '#ef4444', pointerEvents: 'none',
+        }} />
+      ))}
+      {/* Movable body */}
       <div
         onMouseDown={begin('move')}
-        title="드래그로 이동"
+        title="드래그로 이동 · Shift=비율 반전"
         style={{
           position: 'absolute',
           left: rx, top: ry, width: rw, height: rh,
@@ -789,6 +909,21 @@ function ResizeOverlay({ rect, frameW, frameH, scale, onChange }) {
           background: 'rgba(59,130,246,0.04)',
         }}
       />
+      {/* Size label */}
+      {drag && (
+        <div style={{
+          position: 'absolute',
+          left: rx + rw / 2, top: ry + rh + 6,
+          transform: 'translateX(-50%)',
+          background: '#1f2937', color: '#fff',
+          padding: '3px 8px', borderRadius: 4,
+          fontSize: 11, pointerEvents: 'none',
+          fontFamily: 'monospace',
+        }}>
+          {Math.round(rect.w)} × {Math.round(rect.h)}
+        </div>
+      )}
+      {/* Handles */}
       {handles.map((h) => (
         <div
           key={h.id}
@@ -808,6 +943,124 @@ function ResizeOverlay({ rect, frameW, frameH, scale, onChange }) {
       ))}
     </div>
   );
+}
+
+// Apply snap-to-target. Adjusts the rect's moving edge/position by up to SNAP_THRESHOLD.
+// Returns adjusted rect + which guide lines fired.
+function computeSnap(handle, r, xTargets, yTargets, thr) {
+  const out = { ...r, guideX: [], guideY: [] };
+  // Determine which edges/centers are "active" for this drag.
+  let activeXs, activeYs;
+  if (handle === 'move') {
+    activeXs = [['left', r.x], ['centerX', r.x + r.w / 2], ['right', r.x + r.w]];
+    activeYs = [['top', r.y], ['centerY', r.y + r.h / 2], ['bottom', r.y + r.h]];
+  } else {
+    activeXs = [];
+    activeYs = [];
+    if (handle.includes('w')) activeXs.push(['left', r.x]);
+    if (handle.includes('e')) activeXs.push(['right', r.x + r.w]);
+    if (handle.includes('n')) activeYs.push(['top', r.y]);
+    if (handle.includes('s')) activeYs.push(['bottom', r.y + r.h]);
+  }
+  // X snap
+  for (const [edge, val] of activeXs) {
+    let best = null;
+    for (const t of xTargets) {
+      const d = Math.abs(val - t);
+      if (d < thr && (!best || d < best.d)) best = { d, t };
+    }
+    if (best) {
+      const delta = best.t - val;
+      if (handle === 'move' || edge === 'left' || edge === 'centerX') {
+        if (edge === 'left' || handle === 'move') out.x += delta;
+        else if (edge === 'centerX') out.x += delta;
+      }
+      if (edge === 'right' && handle !== 'move') out.w += delta;
+      else if (edge === 'left' && handle !== 'move') { out.x += delta; out.w -= delta; }
+      out.guideX.push(best.t);
+    }
+  }
+  // Y snap
+  for (const [edge, val] of activeYs) {
+    let best = null;
+    for (const t of yTargets) {
+      const d = Math.abs(val - t);
+      if (d < thr && (!best || d < best.d)) best = { d, t };
+    }
+    if (best) {
+      const delta = best.t - val;
+      if (handle === 'move' || edge === 'top' || edge === 'centerY') {
+        if (edge === 'top' || handle === 'move') out.y += delta;
+        else if (edge === 'centerY') out.y += delta;
+      }
+      if (edge === 'bottom' && handle !== 'move') out.h += delta;
+      else if (edge === 'top' && handle !== 'move') { out.y += delta; out.h -= delta; }
+      out.guideY.push(best.t);
+    }
+  }
+  return out;
+}
+
+// Detect strong horizontal/vertical edges in a canvas — used as smart-guide anchor targets.
+function detectFrameAnchors(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const step = Math.max(1, Math.floor(Math.min(w, h) / 300));
+  const sw = Math.max(2, Math.floor(w / step));
+  const sh = Math.max(2, Math.floor(h / step));
+  const small = document.createElement('canvas');
+  small.width = sw;
+  small.height = sh;
+  const ctx = small.getContext('2d');
+  ctx.drawImage(canvas, 0, 0, sw, sh);
+  const data = ctx.getImageData(0, 0, sw, sh).data;
+  const lum = (i) => 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+
+  // Per-row horizontal-edge strength (sum of |luminance diff with row above|)
+  const yScores = new Float32Array(sh);
+  for (let y = 1; y < sh; y++) {
+    let s = 0;
+    for (let x = 0; x < sw; x++) {
+      s += Math.abs(lum(((y) * sw + x) * 4) - lum(((y - 1) * sw + x) * 4));
+    }
+    yScores[y] = s / sw;
+  }
+  const xScores = new Float32Array(sw);
+  for (let x = 1; x < sw; x++) {
+    let s = 0;
+    for (let y = 0; y < sh; y++) {
+      s += Math.abs(lum((y * sw + x) * 4) - lum((y * sw + (x - 1)) * 4));
+    }
+    xScores[x] = s / sh;
+  }
+  // Pick peaks above mean*2.5
+  const peaks = (arr) => {
+    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+    const thr = mean * 2.5;
+    const out = [];
+    for (let i = 1; i < arr.length - 1; i++) {
+      if (arr[i] > thr && arr[i] >= arr[i - 1] && arr[i] >= arr[i + 1]) out.push(i);
+    }
+    return out;
+  };
+  const cluster = (vals, gap) => {
+    if (!vals.length) return [];
+    vals = [...vals].sort((a, b) => a - b);
+    const out = [];
+    let group = [vals[0]];
+    for (let i = 1; i < vals.length; i++) {
+      if (vals[i] - group[group.length - 1] < gap) group.push(vals[i]);
+      else {
+        out.push(Math.round(group.reduce((a, b) => a + b, 0) / group.length));
+        group = [vals[i]];
+      }
+    }
+    out.push(Math.round(group.reduce((a, b) => a + b, 0) / group.length));
+    return out;
+  };
+  const ys = cluster(peaks(yScores).map((v) => v * step), Math.max(8, step * 4));
+  const xs = cluster(peaks(xScores).map((v) => v * step), Math.max(8, step * 4));
+  // Cap to top 30 each to avoid clutter
+  return { xs: xs.slice(0, 30), ys: ys.slice(0, 30) };
 }
 
 async function drawPreview(canvas, item, frameMode, customFrame) {
