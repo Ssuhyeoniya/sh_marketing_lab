@@ -20,11 +20,12 @@ const MAX_IMAGES = 20;
 export default function IphoneMockup() {
   const [frameMode, setFrameMode] = useState('svg'); // 'svg' | 'png'
   const [customFrame, setCustomFrame] = useState(null); // { canvas, screenRect }
-  const [items, setItems] = useState([]); // [{id, name, originalUrl, fittedCanvas, textLayers: [], ocrDone: bool}]
+  const [items, setItems] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [ocrProgress, setOcrProgress] = useState(0);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState('');
+  const [showRectEditor, setShowRectEditor] = useState(false);
 
   const active = items.find((i) => i.id === activeId);
   const step = items.length === 0 ? 0 : !active?.ocrDone ? 1 : 2;
@@ -77,11 +78,16 @@ export default function IphoneMockup() {
     canvas.height = img.naturalHeight;
     const ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0);
-    // Auto-detect screen rect = bounding box of (mostly) transparent pixels.
     const rect = detectTransparentRect(ctx, canvas.width, canvas.height);
     setCustomFrame({ canvas, screenRect: rect });
     setFrameMode('png');
-    showToast('프레임 인식 완료. 화면 영역을 자동으로 감지했습니다.');
+    setShowRectEditor(true);
+    showToast('프레임 업로드 완료. 화면 영역을 확인·조정하세요.');
+  };
+
+  const updateScreenRect = (patch) => {
+    if (!customFrame) return;
+    setCustomFrame({ ...customFrame, screenRect: { ...customFrame.screenRect, ...patch } });
   };
 
   // ---- OCR on active image ----
@@ -93,16 +99,26 @@ export default function IphoneMockup() {
       if (p && p.progress != null) setOcrProgress(Math.round(p.progress * 100));
     });
     const layers = (data.words || [])
-      .filter((w) => w.text && w.text.trim() && w.confidence > 30)
+      .filter((w) => {
+        if (!w.text || !w.text.trim()) return false;
+        if (w.confidence < 60) return false;
+        const t = w.text.trim();
+        if (t.length < 2) return false;
+        if (!/[a-zA-Z0-9가-힣]/.test(t)) return false;
+        const bw = w.bbox.x1 - w.bbox.x0;
+        const bh = w.bbox.y1 - w.bbox.y0;
+        if (bw < 6 || bh < 6) return false;
+        if (bh > bw * 3 || bw > bh * 25) return false;
+        return true;
+      })
       .map((w) => {
         const guess = guessFont(w, active.fittedCanvas);
-        // Sample background color from a tiny strip just above the word
         const bg = sampleBg(active.fittedCanvas, w.bbox);
-        // Sample text color from inside bbox (darkest area)
         const fg = sampleFg(active.fittedCanvas, w.bbox);
         return {
           id: crypto.randomUUID(),
           text: w.text,
+          originalText: w.text,
           x: w.bbox.x0,
           y: w.bbox.y0,
           w: w.bbox.x1 - w.bbox.x0,
@@ -114,6 +130,7 @@ export default function IphoneMockup() {
           color: fg,
           bgColor: bg,
           visible: true,
+          edited: false,
         };
       });
     setItems((it) =>
@@ -128,7 +145,24 @@ export default function IphoneMockup() {
       it.map((x) =>
         x.id !== active.id
           ? x
-          : { ...x, textLayers: x.textLayers.map((l) => (l.id === lid ? { ...l, ...patch } : l)) }
+          : {
+              ...x,
+              textLayers: x.textLayers.map((l) => {
+                if (l.id !== lid) return l;
+                const next = { ...l, ...patch };
+                if (patch.text !== undefined && patch.text !== l.originalText) next.edited = true;
+                return next;
+              }),
+            }
+      )
+    );
+  };
+  const toggleEdited = (lid) => {
+    setItems((it) =>
+      it.map((x) =>
+        x.id !== active.id
+          ? x
+          : { ...x, textLayers: x.textLayers.map((l) => (l.id === lid ? { ...l, edited: !l.edited } : l)) }
       )
     );
   };
@@ -166,9 +200,9 @@ export default function IphoneMockup() {
       // Top-aligned, crop overflow.
       sctx.drawImage(item.fittedCanvas, 0, 0, SCREEN_W, SCREEN_H, 0, 0, SCREEN_W, SCREEN_H);
     }
-    // Overlay edited text: for each layer, paint over original then draw text.
+    // Only overlay layers the user actually edited — leaves icons/shapes intact.
     item.textLayers
-      .filter((l) => l.visible)
+      .filter((l) => l.visible && l.edited)
       .forEach((l) => {
         sctx.fillStyle = l.bgColor || '#ffffff';
         sctx.fillRect(l.x - 1, l.y - 1, l.w + 2, l.h + 2);
@@ -303,6 +337,26 @@ export default function IphoneMockup() {
         </div>
       </div>
 
+      {frameMode === 'png' && customFrame && showRectEditor && (
+        <div style={{ background: '#fff', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <b style={{ fontSize: 12 }}>PNG 프레임 화면 영역 (이미지가 들어갈 위치)</b>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            X <input type="number" value={Math.round(customFrame.screenRect.x)} onChange={(e) => updateScreenRect({ x: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
+          </label>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            Y <input type="number" value={Math.round(customFrame.screenRect.y)} onChange={(e) => updateScreenRect({ y: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
+          </label>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            W <input type="number" value={Math.round(customFrame.screenRect.w)} onChange={(e) => updateScreenRect({ w: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
+          </label>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            H <input type="number" value={Math.round(customFrame.screenRect.h)} onChange={(e) => updateScreenRect({ h: +e.target.value })} style={{ width: 70, padding: '4px 6px', border: '1px solid var(--border)', borderRadius: 4 }} />
+          </label>
+          <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>프레임 크기: {customFrame.canvas.width}×{customFrame.canvas.height}</span>
+          <button className="btn sm" onClick={() => updateScreenRect(detectTransparentRect(customFrame.canvas.getContext('2d'), customFrame.canvas.width, customFrame.canvas.height))}>자동 재감지</button>
+        </div>
+      )}
+
       <div className="content-grid-3" style={{ flex: 1, minHeight: 0 }}>
         {/* LEFT: thumbnails */}
         <div className="panel">
@@ -417,8 +471,15 @@ export default function IphoneMockup() {
               인식된 텍스트는 동일한 폰트·사이즈로 수정할 수 있습니다.
             </p>
           ) : (
-            active.textLayers.map((l) => (
-              <div key={l.id} className="text-layer-card">
+            <>
+              <p style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 10, padding: '8px 10px', background: '#f0f7ff', borderRadius: 6 }}>
+                💡 텍스트를 <b>수정한 항목만</b> 원본 위에 다시 그려집니다. 아이콘·이미지·도형은 그대로 유지됩니다.
+              </p>
+              {active.textLayers.map((l) => (
+              <div key={l.id} className="text-layer-card" style={l.edited ? { borderColor: 'var(--primary)', background: '#eff6ff' } : {}}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, fontSize: 10.5, color: l.edited ? 'var(--primary)' : 'var(--text-muted)' }}>
+                  <span>{l.edited ? '● 편집됨 (오버레이 적용)' : '○ 원본 유지'}</span>
+                </div>
                 <div className="form-row">
                   <label>텍스트</label>
                   <input
@@ -469,15 +530,16 @@ export default function IphoneMockup() {
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                  <button className="btn sm" onClick={() => updateLayer(l.id, { visible: !l.visible })}>
-                    {l.visible ? '숨김' : '표시'}
+                  <button className="btn sm" onClick={() => toggleEdited(l.id)}>
+                    {l.edited ? '원본으로' : '활성화'}
                   </button>
                   <button className="btn sm danger" onClick={() => deleteLayer(l.id)}>
                     삭제
                   </button>
                 </div>
               </div>
-            ))
+              ))}
+            </>
           )}
         </div>
       </div>
@@ -522,9 +584,12 @@ function roundedRectPath(ctx, x, y, w, h, r) {
 
 function detectTransparentRect(ctx, w, h) {
   const data = ctx.getImageData(0, 0, w, h).data;
+  // 1) Try: bounding box of INTERIOR transparent pixels (not edges).
+  //    For PNG mockups where the screen area is cut transparent.
   let minX = w, minY = h, maxX = 0, maxY = 0, found = false;
-  for (let y = 0; y < h; y += 2) {
-    for (let x = 0; x < w; x += 2) {
+  const margin = Math.min(20, Math.floor(Math.min(w, h) * 0.05));
+  for (let y = margin; y < h - margin; y += 2) {
+    for (let x = margin; x < w - margin; x += 2) {
       const a = data[(y * w + x) * 4 + 3];
       if (a < 30) {
         if (x < minX) minX = x;
@@ -535,10 +600,23 @@ function detectTransparentRect(ctx, w, h) {
       }
     }
   }
-  if (!found) {
-    return { x: Math.round(w * 0.05), y: Math.round(h * 0.05), w: Math.round(w * 0.9), h: Math.round(h * 0.9) };
+  if (found && maxX - minX > w * 0.2 && maxY - minY > h * 0.2) {
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }
-  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+  // 2) Fallback: centered rect with iPhone aspect ratio (512:1031 ≈ 1:2.01).
+  const aspect = 1031 / 512;
+  let screenH = Math.round(h * 0.86);
+  let screenW = Math.round(screenH / aspect);
+  if (screenW > w * 0.86) {
+    screenW = Math.round(w * 0.86);
+    screenH = Math.round(screenW * aspect);
+  }
+  return {
+    x: Math.round((w - screenW) / 2),
+    y: Math.round((h - screenH) / 2),
+    w: screenW,
+    h: screenH,
+  };
 }
 
 function sampleBg(canvas, bbox) {
@@ -643,7 +721,7 @@ async function drawPreview(canvas, item, frameMode, customFrame) {
   const ih = item.fittedCanvas.height;
   if (ih <= SCREEN_H) sctx.drawImage(item.fittedCanvas, 0, 0);
   else sctx.drawImage(item.fittedCanvas, 0, 0, SCREEN_W, SCREEN_H, 0, 0, SCREEN_W, SCREEN_H);
-  item.textLayers.filter((l) => l.visible).forEach((l) => {
+  item.textLayers.filter((l) => l.visible && l.edited).forEach((l) => {
     sctx.fillStyle = l.bgColor || '#ffffff';
     sctx.fillRect(l.x - 1, l.y - 1, l.w + 2, l.h + 2);
     sctx.fillStyle = l.color || '#111111';
@@ -674,5 +752,11 @@ async function drawPreview(canvas, item, frameMode, customFrame) {
     const { x, y, w, h } = customFrame.screenRect;
     ctx.drawImage(screen, 0, 0, SCREEN_W, SCREEN_H, x, y, w, h);
     ctx.drawImage(customFrame.canvas, 0, 0);
+    // Outline so user can see where screen area is.
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 6]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.setLineDash([]);
   }
 }

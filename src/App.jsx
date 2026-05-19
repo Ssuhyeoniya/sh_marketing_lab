@@ -5,6 +5,7 @@ import PdfWord from './pages/convert/PdfWord';
 import PdfExcel from './pages/convert/PdfExcel';
 import PdfPpt from './pages/convert/PdfPpt';
 import PdfImage from './pages/convert/PdfImage';
+import SvgPng from './pages/convert/SvgPng';
 import PdfOcrPage from './pages/convert/PdfOcr';
 import Merge from './pages/organize/Merge';
 import Split from './pages/organize/Split';
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="/convert/pdf-excel" element={<PdfExcel />} />
         <Route path="/convert/pdf-ppt" element={<PdfPpt />} />
         <Route path="/convert/pdf-image" element={<PdfImage />} />
+        <Route path="/convert/svg-png" element={<SvgPng />} />
         <Route path="/convert/pdf-ocr" element={<PdfOcrPage />} />
         <Route path="/organize/merge" element={<Merge />} />
         <Route path="/organize/split" element={<Split />} />

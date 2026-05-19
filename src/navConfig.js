@@ -7,6 +7,7 @@ export const navConfig = [
       { path: '/convert/pdf-excel', label: 'PDF ↔ Excel' },
       { path: '/convert/pdf-ppt', label: 'PDF ↔ PowerPoint' },
       { path: '/convert/pdf-image', label: 'PDF ↔ Image' },
+      { path: '/convert/svg-png', label: 'SVG ↔ PNG' },
       { path: '/convert/pdf-ocr', label: 'PDF OCR' },
     ],
   },
