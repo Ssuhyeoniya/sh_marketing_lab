@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Wireframe C - Workflow Studio</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Pretendard', sans-serif; }
+  body { background: #0f1115; color: #e4e6eb; }
+  .layout { display: flex; height: 100vh; overflow: hidden; }
+
+  /* Slim sidebar with category accordions */
+  .sidebar { width: 250px; background: #14171d; border-right: 1px solid #1f242d; padding: 18px 0; overflow-y: auto; flex-shrink: 0; }
+  .brand { padding: 0 20px 16px; font-size: 16px; font-weight: 700; color: #fff; }
+
+  .cat { border-top: 1px solid #1f242d; }
+  .cat > .head { display:flex; justify-content:space-between; align-items:center; padding: 12px 20px; font-size: 13px; color: #8b95a7; cursor:pointer; font-weight: 600; }
+  .cat > .head:hover { color: #fff; }
+  .cat.open > .head { color: #fff; }
+  .cat .items { display:none; padding-bottom: 8px; }
+  .cat.open .items { display:block; }
+  .cat .items a { display:block; padding: 7px 20px 7px 30px; font-size: 13px; color: #b9c0cd; text-decoration:none; }
+  .cat .items a:hover { background: #1c2029; color: #fff; }
+  .cat .items a.active { background: #1d2c4a; color: #6ea8ff; font-weight: 600; }
+
+  /* Main: stepper top + 3-column studio */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  .stepper { background: #14171d; border-bottom: 1px solid #1f242d; padding: 14px 28px; display:flex; align-items:center; gap: 18px; }
+  .step { display:flex; align-items:center; gap:8px; font-size: 13px; color: #6b7280; }
+  .step .n { width: 22px; height: 22px; border-radius: 50%; background: #1f242d; display:flex;align-items:center;justify-content:center; font-size:11px; }
+  .step.active { color: #6ea8ff; }
+  .step.active .n { background: #6ea8ff; color: #14171d; font-weight: 700; }
+  .step.done .n { background: #22c55e; color: #0f1115; }
+  .step .arr { color: #3a414f; }
+
+  .studio { flex: 1; display: grid; grid-template-columns: 280px 1fr 320px; min-height: 0; }
+
+  .col { padding: 18px; overflow-y: auto; }
+  .col-left { border-right: 1px solid #1f242d; background: #14171d; }
+  .col-right { border-left: 1px solid #1f242d; background: #14171d; }
+  .col h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b95a7; margin-bottom: 12px; }
+
+  .thumb-list { display:flex; flex-direction:column; gap:8px; }
+  .thumb { display:flex; gap:10px; padding: 8px; background: #1a1e26; border-radius: 8px; align-items:center; font-size: 12px; }
+  .thumb .pic { width: 36px; height: 72px; background: linear-gradient(135deg,#2a3140,#1a1e26); border-radius: 4px; flex-shrink:0; }
+  .thumb .meta { color: #c0c6d2; }
+  .thumb .meta small { color: #6b7280; display:block; font-size: 10.5px; }
+
+  .add-btn { margin-top: 10px; width: 100%; padding: 10px; background: transparent; border: 1px dashed #3a414f; color: #8b95a7; border-radius: 8px; font-size: 12px; cursor:pointer; }
+  .add-btn:hover { border-color:#6ea8ff; color:#6ea8ff; }
+
+  /* Center canvas */
+  .canvas { padding: 24px; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; }
+  .canvas-title { width:100%; display:flex; justify-content:space-between; align-items:center; margin-bottom: 18px; }
+  .canvas-title h2 { font-size: 18px; color:#fff; }
+  .toolbar { display:flex; gap:6px; }
+  .tbtn { padding: 7px 12px; background: #1a1e26; border:1px solid #2a3140; color:#c0c6d2; border-radius:6px; font-size:12px; cursor:pointer; }
+  .tbtn.primary { background:#6ea8ff; border-color:#6ea8ff; color:#0f1115; font-weight: 600; }
+
+  .stage { width: 290px; height: 580px; background: #1a1e26; border-radius: 36px; border: 8px solid #2a3140; display:flex; align-items:center; justify-content:center; color:#6b7280; font-size:12px; position:relative; }
+  .stage::before { content:''; position:absolute; top: 10px; left:50%; transform:translateX(-50%); width: 90px; height: 22px; background: #0f1115; border-radius: 0 0 16px 16px; }
+
+  /* Right panel - properties */
+  .prop { background: #1a1e26; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+  .prop label { display:block; font-size: 11px; color: #8b95a7; margin-bottom: 5px; }
+  .prop input, .prop select { width:100%; padding: 7px 9px; background: #0f1115; border: 1px solid #2a3140; color:#e4e6eb; border-radius: 5px; font-size: 12px; }
+  .text-layer { background: #1a1e26; border-radius:8px; padding:10px; margin-bottom:8px; font-size:12px; }
+  .text-layer .tx { color:#e4e6eb; margin-bottom:4px; }
+  .text-layer .ft { color:#6ea8ff; font-size: 10.5px; }
+
+  .footer-note { padding: 12px 28px; border-top: 1px solid #1f242d; background:#14171d; font-size: 11.5px; color: #6b7280; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">⚡ SH Marketing Lab</div>
+
+    <div class="cat">
+      <div class="head" onclick="this.parentElement.classList.toggle('open')">변환 <span>▸</span></div>
+      <div class="items">
+        <a>PDF ↔ Word</a><a>PDF ↔ Excel</a><a>PDF ↔ PowerPoint</a><a>PDF ↔ Image</a><a>PDF OCR</a>
+      </div>
+    </div>
+    <div class="cat">
+      <div class="head" onclick="this.parentElement.classList.toggle('open')">정리 <span>▸</span></div>
+      <div class="items">
+        <a>병합</a><a>분할</a><a>회전</a><a>페이지 삭제</a><a>페이지 추출</a>
+      </div>
+    </div>
+    <div class="cat">
+      <div class="head" onclick="this.parentElement.classList.toggle('open')">편집 <span>▸</span></div>
+      <div class="items">
+        <a>텍스트 편집</a><a>자르기</a><a>워터마크</a><a>페이지 번호</a>
+      </div>
+    </div>
+    <div class="cat open">
+      <div class="head" onclick="this.parentElement.classList.toggle('open')">목업 <span>▾</span></div>
+      <div class="items">
+        <a class="active">아이폰</a><a>웹</a>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="stepper">
+      <div class="step done"><span class="n">✓</span> 업로드</div>
+      <span class="arr">›</span>
+      <div class="step active"><span class="n">2</span> 편집 / 텍스트 인식</div>
+      <span class="arr">›</span>
+      <div class="step"><span class="n">3</span> 미리보기</div>
+      <span class="arr">›</span>
+      <div class="step"><span class="n">4</span> 다운로드</div>
+      <div style="margin-left:auto;font-size:12px;color:#8b95a7;">진행 12 / 20</div>
+    </div>
+
+    <div class="studio">
+      <!-- Left: uploaded thumbs -->
+      <div class="col col-left">
+        <h3>업로드 이미지 (12/20)</h3>
+        <div class="thumb-list">
+          <div class="thumb"><div class="pic"></div><div class="meta">screen_01<small>512×1031</small></div></div>
+          <div class="thumb"><div class="pic"></div><div class="meta">screen_02<small>720→512 리사이즈</small></div></div>
+          <div class="thumb"><div class="pic"></div><div class="meta">screen_03<small>512×1031</small></div></div>
+          <div class="thumb"><div class="pic"></div><div class="meta">screen_04<small>512×1031</small></div></div>
+        </div>
+        <button class="add-btn">＋ 이미지 추가</button>
+      </div>
+
+      <!-- Center: canvas -->
+      <div class="canvas">
+        <div class="canvas-title">
+          <h2>아이폰 목업</h2>
+          <div class="toolbar">
+            <button class="tbtn">OCR 재실행</button>
+            <button class="tbtn">레이아웃</button>
+            <button class="tbtn primary">전체 ZIP 다운로드</button>
+          </div>
+        </div>
+        <div class="stage">[ 목업 + 끼워진 이미지 ]</div>
+      </div>
+
+      <!-- Right: properties + detected text layers -->
+      <div class="col col-right">
+        <h3>속성</h3>
+        <div class="prop">
+          <label>프레임</label>
+          <select><option>iPhone 15 Pro · Titanium</option></select>
+        </div>
+        <div class="prop">
+          <label>이미지 정렬 (너비 512 기준)</label>
+          <select><option>중앙 정렬 / 상단</option></select>
+        </div>
+
+        <h3 style="margin-top:18px;">인식된 텍스트</h3>
+        <div class="text-layer">
+          <div class="tx">"오늘의 추천"</div>
+          <div class="ft">SF Pro · Bold · 24px</div>
+        </div>
+        <div class="text-layer">
+          <div class="tx">"새로운 발견을 시작하세요"</div>
+          <div class="ft">SF Pro · Regular · 14px</div>
+        </div>
+        <button class="add-btn">＋ 텍스트 레이어 추가</button>
+      </div>
+    </div>
+
+    <div class="footer-note">
+      Wireframe C — 워크플로우 스튜디오. 상단 스텝퍼 + 좌(파일) · 중(캔버스) · 우(속성/OCR 레이어) 3분할. 편집 기능과 일괄 처리에 강함.
+    </div>
+  </main>
+</div>
+</body>
+</html>

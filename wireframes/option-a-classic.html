@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Wireframe A - Classic Sidebar</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Pretendard', sans-serif; }
+  body { background: #f5f6f8; color: #222; }
+  .layout { display: flex; min-height: 100vh; }
+
+  /* Sidebar */
+  .sidebar { width: 260px; background: #1e2532; color: #cfd4dc; padding: 20px 0; flex-shrink: 0; }
+  .sidebar .brand { padding: 0 22px 20px; font-size: 18px; font-weight: 700; color: #fff; border-bottom: 1px solid #2a3140; }
+  .nav-group { padding: 14px 0; border-bottom: 1px solid #2a3140; }
+  .nav-group h4 { padding: 0 22px 8px; font-size: 11px; letter-spacing: 0.08em; color: #7b8493; text-transform: uppercase; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 22px; font-size: 14px; cursor: pointer; color: #cfd4dc; }
+  .nav-item:hover { background: #283041; color: #fff; }
+  .nav-item.active { background: #3b82f6; color: #fff; }
+  .nav-item .dot { width: 6px; height: 6px; background: #4a5263; border-radius: 50%; }
+  .nav-item.active .dot { background: #fff; }
+
+  /* Main */
+  .main { flex: 1; padding: 28px 36px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
+  .crumb { font-size: 13px; color: #6b7280; }
+  .crumb b { color: #111; }
+  .actions { display: flex; gap: 10px; }
+  .btn { padding: 8px 14px; border-radius: 6px; border: 1px solid #d1d5db; background: #fff; font-size: 13px; cursor: pointer; }
+  .btn.primary { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+
+  h1.page-title { font-size: 22px; margin-bottom: 6px; }
+  .desc { color: #6b7280; font-size: 13px; margin-bottom: 22px; }
+
+  /* Two column: upload + preview */
+  .workspace { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 22px; min-height: 460px; }
+  .panel h3 { font-size: 15px; margin-bottom: 14px; color: #111; }
+
+  .drop { border: 2px dashed #c7cdd6; border-radius: 8px; padding: 60px 20px; text-align: center; color: #6b7280; background: #fafbfc; }
+  .drop .icon { width: 52px; height: 52px; border-radius: 50%; background: #eef2f7; margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; font-size: 22px; color: #3b82f6; }
+
+  .file-list { margin-top: 16px; }
+  .file-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: #f7f8fa; border-radius: 6px; font-size: 13px; margin-bottom: 6px; }
+
+  .preview-empty { display: flex; align-items: center; justify-content: center; height: 360px; color: #9ca3af; background: #fafbfc; border-radius: 8px; border: 1px dashed #e5e7eb; }
+
+  .footnote { margin-top: 20px; padding: 14px; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; font-size: 12px; color: #6b7280; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">SH Marketing Lab</div>
+
+    <div class="nav-group">
+      <h4>변환</h4>
+      <div class="nav-item"><span class="dot"></span>PDF ↔ Word</div>
+      <div class="nav-item"><span class="dot"></span>PDF ↔ Excel</div>
+      <div class="nav-item"><span class="dot"></span>PDF ↔ PowerPoint</div>
+      <div class="nav-item"><span class="dot"></span>PDF ↔ Image</div>
+      <div class="nav-item"><span class="dot"></span>PDF OCR</div>
+    </div>
+
+    <div class="nav-group">
+      <h4>정리</h4>
+      <div class="nav-item"><span class="dot"></span>병합</div>
+      <div class="nav-item"><span class="dot"></span>분할</div>
+      <div class="nav-item"><span class="dot"></span>회전</div>
+      <div class="nav-item"><span class="dot"></span>페이지 삭제</div>
+      <div class="nav-item"><span class="dot"></span>페이지 추출</div>
+    </div>
+
+    <div class="nav-group">
+      <h4>편집</h4>
+      <div class="nav-item"><span class="dot"></span>텍스트 편집</div>
+      <div class="nav-item"><span class="dot"></span>자르기</div>
+      <div class="nav-item"><span class="dot"></span>워터마크</div>
+      <div class="nav-item"><span class="dot"></span>페이지 번호</div>
+    </div>
+
+    <div class="nav-group">
+      <h4>목업</h4>
+      <div class="nav-item active"><span class="dot"></span>아이폰</div>
+      <div class="nav-item"><span class="dot"></span>웹</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="crumb">목업 / <b>아이폰 목업</b></div>
+      <div class="actions">
+        <button class="btn">초기화</button>
+        <button class="btn primary">전체 다운로드</button>
+      </div>
+    </div>
+
+    <h1 class="page-title">아이폰 목업 생성기</h1>
+    <p class="desc">목업 프레임 안에 이미지를 끼워넣고, 텍스트를 인식해 동일 폰트로 수정 가능합니다. 최대 20장 일괄 다운로드.</p>
+
+    <section class="workspace">
+      <div class="panel">
+        <h3>① 이미지 업로드 (최대 20장 · 512×1031 권장)</h3>
+        <div class="drop">
+          <div class="icon">↑</div>
+          <div>여기에 드래그하거나 클릭해서 업로드</div>
+          <div style="font-size:12px;margin-top:6px;">초과 시 너비 512 기준 자동 리사이즈</div>
+        </div>
+        <div class="file-list">
+          <div class="file-row"><span>screen_01.png · 512×1031</span><span style="color:#3b82f6;">미리보기</span></div>
+          <div class="file-row"><span>screen_02.png · 720×1480 → 리사이즈</span><span style="color:#3b82f6;">미리보기</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>② 샘플 미리보기 · 텍스트 편집</h3>
+        <div class="preview-empty">[ 아이폰 목업 + 끼워진 이미지 프리뷰 ]</div>
+        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn">텍스트 자동 인식 (OCR)</button>
+          <button class="btn">폰트 매칭</button>
+          <button class="btn">레이어 편집</button>
+        </div>
+      </div>
+    </section>
+
+    <div class="footnote">
+      Wireframe A — 클래식 사이드바 + 좌(업로드) / 우(미리보기) 2단 워크스페이스. 직관적이고 익숙한 패턴.
+    </div>
+  </main>
+</div>
+</body>
+</html>
