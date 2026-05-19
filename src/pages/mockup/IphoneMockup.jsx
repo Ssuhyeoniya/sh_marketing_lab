@@ -16,6 +16,7 @@ import {
 } from './IphoneFrame';
 import { downloadBlob } from '../../utils/pdf';
 import { useFontsReady } from '../../utils/fonts';
+import { SYSTEM_FONTS as FONT_OPTIONS } from '../../utils/ocr';
 import TextLayersOverlay from '../../components/TextLayersOverlay';
 
 const MAX_IMAGES = 20;
@@ -163,7 +164,9 @@ export default function IphoneMockup() {
               textLayers: x.textLayers.map((l) => {
                 if (l.id !== lid) return l;
                 const next = { ...l, ...patch };
-                if (patch.text !== undefined && patch.text !== l.originalText) next.edited = true;
+                // Any meaningful change marks the layer as edited → canvas overlay renders.
+                const EDIT_KEYS = ['text', 'fontFamily', 'fontName', 'fontWeight', 'fontSize', 'color', 'bgColor', 'x', 'y', 'w', 'h'];
+                if (EDIT_KEYS.some((k) => patch[k] !== undefined)) next.edited = true;
                 return next;
               }),
             }
@@ -585,19 +588,6 @@ export default function IphoneMockup() {
 
 // ---- Helpers ----
 
-const FONT_OPTIONS = [
-  { name: 'SF Pro', family: '-apple-system, BlinkMacSystemFont, sans-serif', weight: 400 },
-  { name: 'SF Pro Bold', family: '-apple-system, BlinkMacSystemFont, sans-serif', weight: 700 },
-  { name: 'Pretendard', family: 'Pretendard, sans-serif', weight: 500 },
-  { name: 'Pretendard Bold', family: 'Pretendard, sans-serif', weight: 700 },
-  { name: 'Noto Sans KR', family: '"Noto Sans KR", sans-serif', weight: 400 },
-  { name: 'Noto Sans KR Bold', family: '"Noto Sans KR", sans-serif', weight: 700 },
-  { name: 'Helvetica', family: 'Helvetica, Arial, sans-serif', weight: 400 },
-  { name: 'Helvetica Bold', family: 'Helvetica, Arial, sans-serif', weight: 700 },
-  { name: 'Times New Roman', family: '"Times New Roman", serif', weight: 400 },
-  { name: 'Courier New', family: '"Courier New", monospace', weight: 400 },
-];
-
 function stripExt(name) {
   return name.replace(/\.[^.]+$/, '');
 }
@@ -766,8 +756,8 @@ function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectC
       const availH = Math.max(120, host.clientHeight - padY);
       const sw = availW / frameW;
       const sh = availH / frameH;
-      // Use whichever is more restrictive, but cap at 1.0 (don't upscale beyond native)
-      const s = Math.max(0.1, Math.min(sw, sh, 1.0));
+      // Fill available space — allow upscaling above native (cap at 3x to keep things sane).
+      const s = Math.max(0.15, Math.min(sw, sh, 3));
       setScale(s);
     };
     update();

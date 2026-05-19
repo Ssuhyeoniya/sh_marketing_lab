@@ -1,11 +1,18 @@
 import { useEffect, useState } from 'react';
 
 // Preload key fonts (so canvas can use them) and notify when ready.
+// Preload every weight we let users pick — required so canvas can render in those weights.
 const TARGET_FONTS = [
+  '300 16px Pretendard',
   '400 16px Pretendard',
+  '500 16px Pretendard',
+  '600 16px Pretendard',
   '700 16px Pretendard',
+  '800 16px Pretendard',
   '400 16px "Noto Sans KR"',
+  '500 16px "Noto Sans KR"',
   '700 16px "Noto Sans KR"',
+  '900 16px "Noto Sans KR"',
 ];
 
 let readyPromise = null;

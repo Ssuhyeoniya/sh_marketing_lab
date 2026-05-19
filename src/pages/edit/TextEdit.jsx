@@ -5,20 +5,10 @@ import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
 import { recognizeImage, guessFont } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob } from '../../utils/pdf';
 import { useFontsReady } from '../../utils/fonts';
+import { SYSTEM_FONTS } from '../../utils/ocr';
 import TextLayersOverlay from '../../components/TextLayersOverlay';
 
-const FONT_OPTIONS = [
-  { name: 'SF Pro', family: '-apple-system, BlinkMacSystemFont, sans-serif', weight: 400 },
-  { name: 'SF Pro Bold', family: '-apple-system, BlinkMacSystemFont, sans-serif', weight: 700 },
-  { name: 'Pretendard', family: 'Pretendard, sans-serif', weight: 500 },
-  { name: 'Pretendard Bold', family: 'Pretendard, sans-serif', weight: 700 },
-  { name: 'Noto Sans KR', family: '"Noto Sans KR", sans-serif', weight: 400 },
-  { name: 'Noto Sans KR Bold', family: '"Noto Sans KR", sans-serif', weight: 700 },
-  { name: 'Helvetica', family: 'Helvetica, Arial, sans-serif', weight: 400 },
-  { name: 'Helvetica Bold', family: 'Helvetica, Arial, sans-serif', weight: 700 },
-  { name: 'Times New Roman', family: '"Times New Roman", serif', weight: 400 },
-  { name: 'Courier New', family: '"Courier New", monospace', weight: 400 },
-];
+const FONT_OPTIONS = SYSTEM_FONTS;
 
 export default function TextEdit() {
   // pages: [{ id, name, canvas, layers, ocrDone }]
@@ -186,7 +176,8 @@ export default function TextEdit() {
               layers: p.layers.map((l) => {
                 if (l.id !== id) return l;
                 const next = { ...l, ...patch };
-                if (patch.text !== undefined && patch.text !== l.originalText) next.edited = true;
+                const EDIT_KEYS = ['text', 'fontFamily', 'fontName', 'fontWeight', 'fontSize', 'color', 'bgColor', 'x', 'y', 'w', 'h'];
+                if (EDIT_KEYS.some((k) => patch[k] !== undefined)) next.edited = true;
                 return next;
               }),
             }
