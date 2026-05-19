@@ -97,7 +97,7 @@ export default function TextEdit() {
           fontName: g.font.name,
           fontSize: g.size,
           fontWeight: g.weight,
-          color: sampleFg(page.canvas, w.bbox),
+          color: (() => { const bg = sampleBg(page.canvas, w.bbox); return sampleFg(page.canvas, w.bbox, bg); })(),
           bgColor: sampleBg(page.canvas, w.bbox),
           visible: true,
           edited: false,
@@ -145,15 +145,7 @@ export default function TextEdit() {
     c.height = current.canvas.height;
     const ctx = c.getContext('2d');
     ctx.drawImage(current.canvas, 0, 0);
-    // Only render layers that user has actually edited.
-    current.layers.filter((l) => l.visible && l.edited).forEach((l) => {
-      ctx.fillStyle = l.bgColor || '#ffffff';
-      ctx.fillRect(l.x - 1, l.y - 1, l.w + 2, l.h + 2);
-      ctx.fillStyle = l.color || '#111111';
-      ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
-      ctx.textBaseline = 'top';
-      ctx.fillText(l.text, l.x, l.y);
-    });
+    current.layers.filter((l) => l.visible && l.edited).forEach((l) => drawTextOverlay(ctx, l));
   }, [current, currentIdx, pages]);
 
   const update = (id, patch) => {
@@ -203,14 +195,7 @@ export default function TextEdit() {
         c.height = p.canvas.height;
         const ctx = c.getContext('2d');
         ctx.drawImage(p.canvas, 0, 0);
-        p.layers.filter((l) => l.visible && l.edited).forEach((l) => {
-          ctx.fillStyle = l.bgColor || '#ffffff';
-          ctx.fillRect(l.x - 1, l.y - 1, l.w + 2, l.h + 2);
-          ctx.fillStyle = l.color || '#111111';
-          ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
-          ctx.textBaseline = 'top';
-          ctx.fillText(l.text, l.x, l.y);
-        });
+        p.layers.filter((l) => l.visible && l.edited).forEach((l) => drawTextOverlay(ctx, l));
         const blob = await canvasToBlob(c, 'image/png');
         zip.file(`${stripExt(srcName) || 'edited'}-p${String(p.pageNum).padStart(2, '0')}.png`, blob);
       }
@@ -337,27 +322,85 @@ export default function TextEdit() {
 }
 
 function stripExt(s) { return (s || '').replace(/\.[^.]+$/, ''); }
+
+function drawTextOverlay(ctx, l) {
+  ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
+  const m = ctx.measureText(l.text || ' ');
+  const ascent = m.actualBoundingBoxAscent || (l.fontSize || 14) * 0.8;
+  const descent = m.actualBoundingBoxDescent || (l.fontSize || 14) * 0.25;
+  const newW = m.width;
+  const baseY = l.y + l.h;
+  const newTop = baseY - ascent;
+  const newBottom = baseY + descent;
+  const clearX = l.x - 2;
+  const clearY = Math.min(l.y - 2, newTop - 2);
+  const clearW = Math.max(l.w + 4, Math.ceil(newW) + 4);
+  const clearH = Math.max(l.h + 4, Math.ceil(newBottom - newTop) + 4);
+  ctx.fillStyle = l.bgColor || '#ffffff';
+  ctx.fillRect(clearX, clearY, clearW, clearH);
+  const fg = ensureContrast(l.color || '#111111', l.bgColor || '#ffffff');
+  ctx.fillStyle = fg;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(l.text || '', l.x, baseY);
+}
+function ensureContrast(fg, bg) {
+  const a = parseRgb(fg), b = parseRgb(bg);
+  if (!a || !b) return fg;
+  const la = 0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2];
+  const lb = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2];
+  if (Math.abs(la - lb) < 40) return lb > 128 ? '#111111' : '#ffffff';
+  return fg;
+}
+function parseRgb(s) {
+  if (!s) return null;
+  if (s.startsWith('#')) {
+    const v = s.slice(1);
+    return [parseInt(v.slice(0, 2), 16), parseInt(v.slice(2, 4), 16), parseInt(v.slice(4, 6), 16)];
+  }
+  const m = s.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  return m ? [+m[1], +m[2], +m[3]] : null;
+}
 function sampleBg(canvas, bbox) {
   const ctx = canvas.getContext('2d');
-  try {
-    const p = ctx.getImageData(Math.max(0, Math.floor((bbox.x0 + bbox.x1) / 2)), Math.max(0, bbox.y0 - 4), 1, 1).data;
-    return `rgb(${p[0]},${p[1]},${p[2]})`;
-  } catch { return '#ffffff'; }
+  const W = canvas.width, H = canvas.height;
+  const bh = bbox.y1 - bbox.y0;
+  const margin = Math.max(6, Math.round(bh * 0.6));
+  const positions = [
+    [Math.round((bbox.x0 + bbox.x1) / 2), bbox.y0 - margin],
+    [Math.round((bbox.x0 + bbox.x1) / 2), bbox.y1 + margin],
+    [bbox.x0 - margin, Math.round((bbox.y0 + bbox.y1) / 2)],
+    [bbox.x1 + margin, Math.round((bbox.y0 + bbox.y1) / 2)],
+  ];
+  const samples = [];
+  for (const [x, y] of positions) {
+    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+    try {
+      const p = ctx.getImageData(x, y, 1, 1).data;
+      samples.push([p[0], p[1], p[2]]);
+    } catch {}
+  }
+  if (!samples.length) return '#ffffff';
+  const median = (arr) => arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+  return `rgb(${median(samples.map((s) => s[0]))},${median(samples.map((s) => s[1]))},${median(samples.map((s) => s[2]))})`;
 }
-function sampleFg(canvas, bbox) {
+function sampleFg(canvas, bbox, bgRgb) {
   const ctx = canvas.getContext('2d');
   const w = bbox.x1 - bbox.x0, h = bbox.y1 - bbox.y0;
-  if (w < 2 || h < 2) return '#111';
+  if (w < 2 || h < 2) return '#111111';
+  const bg = parseRgb(bgRgb) || [255, 255, 255];
+  const bgLum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
   try {
     const data = ctx.getImageData(bbox.x0, bbox.y0, w, h).data;
+    const darkerExpected = bgLum > 128;
     let r=0,g=0,b=0,n=0;
     for (let i = 0; i < data.length; i += 4) {
       const lum = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
-      if (lum < 128) { r += data[i]; g += data[i+1]; b += data[i+2]; n++; }
+      const diff = darkerExpected ? bgLum - lum : lum - bgLum;
+      if (diff > 50) { r += data[i]; g += data[i+1]; b += data[i+2]; n++; }
     }
-    if (!n) return '#111';
+    if (!n) return darkerExpected ? '#111111' : '#ffffff';
     return `rgb(${Math.round(r/n)},${Math.round(g/n)},${Math.round(b/n)})`;
-  } catch { return '#111'; }
+  } catch { return '#111111'; }
 }
 function rgbToHex(s) {
   if (!s) return '#000000';

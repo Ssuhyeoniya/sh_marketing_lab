@@ -12,6 +12,7 @@ import {
   SCREEN_Y,
   FRAME_W,
   FRAME_H,
+  BEZEL,
 } from './IphoneFrame';
 import { downloadBlob } from '../../utils/pdf';
 
@@ -116,7 +117,7 @@ export default function IphoneMockup() {
       .map((w) => {
         const guess = guessFont(w, active.fittedCanvas);
         const bg = sampleBg(active.fittedCanvas, w.bbox);
-        const fg = sampleFg(active.fittedCanvas, w.bbox);
+        const fg = sampleFg(active.fittedCanvas, w.bbox, bg);
         return {
           id: crypto.randomUUID(),
           text: w.text,
@@ -186,60 +187,29 @@ export default function IphoneMockup() {
 
   // ---- Composition ----
   const composeOne = async (item) => {
-    // Step 1: build the screen canvas (512 x 1031) — image with edited text overlaid.
-    const screen = document.createElement('canvas');
-    screen.width = SCREEN_W;
-    screen.height = SCREEN_H;
-    const sctx = screen.getContext('2d');
-    // Background fill (in case image is shorter than 1031)
-    sctx.fillStyle = '#ffffff';
-    sctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
-    // Draw the fitted image (width 512). Center vertically if shorter than 1031, else top-aligned crop to 1031.
-    const ih = item.fittedCanvas.height;
-    if (ih <= SCREEN_H) {
-      sctx.drawImage(item.fittedCanvas, 0, 0);
-    } else {
-      // Top-aligned, crop overflow.
-      sctx.drawImage(item.fittedCanvas, 0, 0, SCREEN_W, SCREEN_H, 0, 0, SCREEN_W, SCREEN_H);
-    }
-    // Only overlay layers the user actually edited — leaves icons/shapes intact.
-    item.textLayers
-      .filter((l) => l.visible && l.edited)
-      .forEach((l) => {
-        sctx.fillStyle = l.bgColor || '#ffffff';
-        sctx.fillRect(l.x - 1, l.y - 1, l.w + 2, l.h + 2);
-        sctx.fillStyle = l.color || '#111111';
-        sctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
-        sctx.textBaseline = 'top';
-        sctx.fillText(l.text, l.x, l.y);
-      });
+    // Screen canvas is sized to the full fitted image (no cropping).
+    const screen = buildScreenCanvas(item);
+    const screenH = screen.height;
 
-    // Step 2: composite onto frame.
     if (frameMode === 'svg') {
-      // Render SVG frame to a canvas using an XML serializer.
+      // Frame stretches vertically to fit — long screenshots become valid "scroll mockups".
+      const frameH = screenH + BEZEL * 2;
+      const frameW = FRAME_W;
       const out = document.createElement('canvas');
-      out.width = FRAME_W;
-      out.height = FRAME_H;
+      out.width = frameW;
+      out.height = frameH;
       const octx = out.getContext('2d');
-      // Draw SVG frame as background by rasterizing it
-      const svgEl = document.getElementById('iphone-frame-svg-template');
-      if (svgEl) {
-        const xml = new XMLSerializer().serializeToString(svgEl);
-        const svgBlob = new Blob([xml], { type: 'image/svg+xml' });
-        const url = URL.createObjectURL(svgBlob);
-        const fimg = await loadImage(url);
-        URL.revokeObjectURL(url);
-        octx.drawImage(fimg, 0, 0, FRAME_W, FRAME_H);
-      }
-      // Draw screen with rounded mask
+      const url = URL.createObjectURL(new Blob([makeIphoneFrameSvg(frameW, frameH)], { type: 'image/svg+xml' }));
+      const fimg = await loadImage(url);
+      URL.revokeObjectURL(url);
+      octx.drawImage(fimg, 0, 0, frameW, frameH);
       octx.save();
-      roundedRectPath(octx, SCREEN_X, SCREEN_Y, SCREEN_W, SCREEN_H, 36);
+      roundedRectPath(octx, BEZEL, BEZEL, SCREEN_W, screenH, 36);
       octx.clip();
-      octx.drawImage(screen, SCREEN_X, SCREEN_Y);
+      octx.drawImage(screen, BEZEL, BEZEL);
       octx.restore();
-      // Dynamic island on top
       octx.fillStyle = '#000';
-      roundedRectPath(octx, FRAME_W / 2 - 60, SCREEN_Y + 12, 120, 34, 17);
+      roundedRectPath(octx, frameW / 2 - 60, BEZEL + 12, 120, 34, 17);
       octx.fill();
       return out;
     } else if (customFrame) {
@@ -247,9 +217,12 @@ export default function IphoneMockup() {
       out.width = customFrame.canvas.width;
       out.height = customFrame.canvas.height;
       const octx = out.getContext('2d');
-      // Draw screen first, then frame on top
+      // Fit full image inside user rect, preserving aspect — letterbox with white if needed.
       const { x, y, w, h } = customFrame.screenRect;
-      octx.drawImage(screen, 0, 0, SCREEN_W, SCREEN_H, x, y, w, h);
+      octx.fillStyle = '#ffffff';
+      octx.fillRect(x, y, w, h);
+      const fit = fitRect(SCREEN_W, screenH, w, h);
+      octx.drawImage(screen, x + fit.x, y + fit.y, fit.w, fit.h);
       octx.drawImage(customFrame.canvas, 0, 0);
       return out;
     }
@@ -666,33 +639,58 @@ function detectTransparentRect(ctx, w, h) {
   };
 }
 
+// Sample background from several pixels OUTSIDE the bbox; pick the most extreme luminance
+// (background tends to be far from text — either much lighter or much darker).
 function sampleBg(canvas, bbox) {
-  // Sample a few pixels just above the bbox.
   const ctx = canvas.getContext('2d');
-  const y = Math.max(0, bbox.y0 - 4);
-  const x = Math.max(0, Math.floor((bbox.x0 + bbox.x1) / 2));
-  try {
-    const p = ctx.getImageData(x, y, 1, 1).data;
-    return `rgb(${p[0]},${p[1]},${p[2]})`;
-  } catch {
-    return '#ffffff';
+  const W = canvas.width, H = canvas.height;
+  const bw = bbox.x1 - bbox.x0, bh = bbox.y1 - bbox.y0;
+  const margin = Math.max(6, Math.round(bh * 0.6));
+  const positions = [
+    [Math.round((bbox.x0 + bbox.x1) / 2), bbox.y0 - margin],
+    [Math.round((bbox.x0 + bbox.x1) / 2), bbox.y1 + margin],
+    [bbox.x0 - margin, Math.round((bbox.y0 + bbox.y1) / 2)],
+    [bbox.x1 + margin, Math.round((bbox.y0 + bbox.y1) / 2)],
+    [bbox.x0 - margin, bbox.y0 - margin],
+    [bbox.x1 + margin, bbox.y1 + margin],
+  ];
+  const samples = [];
+  for (const [x, y] of positions) {
+    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+    try {
+      const p = ctx.getImageData(x, y, 1, 1).data;
+      samples.push([p[0], p[1], p[2]]);
+    } catch {}
   }
+  if (!samples.length) return '#ffffff';
+  // Compute median of each channel — robust to outlier samples that hit text or another object.
+  const median = (arr) => arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+  const r = median(samples.map((s) => s[0]));
+  const g = median(samples.map((s) => s[1]));
+  const b = median(samples.map((s) => s[2]));
+  return `rgb(${r},${g},${b})`;
 }
 
-function sampleFg(canvas, bbox) {
+// Sample foreground: pick pixels in bbox with highest contrast from the sampled background.
+function sampleFg(canvas, bbox, bgRgb) {
   const ctx = canvas.getContext('2d');
   const w = bbox.x1 - bbox.x0, h = bbox.y1 - bbox.y0;
   if (w < 2 || h < 2) return '#111111';
+  const bg = parseRgb(bgRgb) || [255, 255, 255];
+  const bgLum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
   try {
     const data = ctx.getImageData(bbox.x0, bbox.y0, w, h).data;
+    // Determine direction (darker text on light bg, or lighter text on dark bg)
+    const darkerExpected = bgLum > 128;
     let r = 0, g = 0, b = 0, n = 0;
     for (let i = 0; i < data.length; i += 4) {
       const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      if (lum < 128) {
+      const diff = darkerExpected ? bgLum - lum : lum - bgLum;
+      if (diff > 50) {
         r += data[i]; g += data[i + 1]; b += data[i + 2]; n++;
       }
     }
-    if (!n) return '#111111';
+    if (!n) return darkerExpected ? '#111111' : '#ffffff';
     return `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})`;
   } catch {
     return '#111111';
@@ -738,8 +736,10 @@ function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectC
   }, [item, frameMode, customFrame]);
 
   const previewScale = 0.55;
+  // In SVG mode the frame stretches to fit a tall image — compute per active item.
+  const screenH = item ? item.fittedCanvas.height : SCREEN_H;
   const frameW = frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W;
-  const frameH = frameMode === 'svg' ? FRAME_H : customFrame?.canvas.height || FRAME_H;
+  const frameH = frameMode === 'svg' ? screenH + BEZEL * 2 : customFrame?.canvas.height || FRAME_H;
   const dispW = frameW * previewScale;
   const dispH = frameH * previewScale;
 
@@ -1065,47 +1065,125 @@ function detectFrameAnchors(canvas) {
 
 async function drawPreview(canvas, item, frameMode, customFrame) {
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  // Build screen
-  const screen = document.createElement('canvas');
-  screen.width = SCREEN_W;
-  screen.height = SCREEN_H;
-  const sctx = screen.getContext('2d');
-  sctx.fillStyle = '#ffffff';
-  sctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
-  const ih = item.fittedCanvas.height;
-  if (ih <= SCREEN_H) sctx.drawImage(item.fittedCanvas, 0, 0);
-  else sctx.drawImage(item.fittedCanvas, 0, 0, SCREEN_W, SCREEN_H, 0, 0, SCREEN_W, SCREEN_H);
-  item.textLayers.filter((l) => l.visible && l.edited).forEach((l) => {
-    sctx.fillStyle = l.bgColor || '#ffffff';
-    sctx.fillRect(l.x - 1, l.y - 1, l.w + 2, l.h + 2);
-    sctx.fillStyle = l.color || '#111111';
-    sctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
-    sctx.textBaseline = 'top';
-    sctx.fillText(l.text, l.x, l.y);
-  });
+  const screen = buildScreenCanvas(item);
+  const screenH = screen.height;
 
   if (frameMode === 'svg') {
-    const svgEl = document.getElementById('iphone-frame-svg-template');
-    if (svgEl) {
-      const xml = new XMLSerializer().serializeToString(svgEl);
-      const svgBlob = new Blob([xml], { type: 'image/svg+xml' });
-      const url = URL.createObjectURL(svgBlob);
-      const fimg = await loadImage(url);
-      URL.revokeObjectURL(url);
-      ctx.drawImage(fimg, 0, 0, FRAME_W, FRAME_H);
-    }
+    const frameH = screenH + BEZEL * 2;
+    const frameW = FRAME_W;
+    canvas.width = frameW;
+    canvas.height = frameH;
+    ctx.clearRect(0, 0, frameW, frameH);
+    const url = URL.createObjectURL(new Blob([makeIphoneFrameSvg(frameW, frameH)], { type: 'image/svg+xml' }));
+    const fimg = await loadImage(url);
+    URL.revokeObjectURL(url);
+    ctx.drawImage(fimg, 0, 0, frameW, frameH);
     ctx.save();
-    roundedRectPath(ctx, SCREEN_X, SCREEN_Y, SCREEN_W, SCREEN_H, 36);
+    roundedRectPath(ctx, BEZEL, BEZEL, SCREEN_W, screenH, 36);
     ctx.clip();
-    ctx.drawImage(screen, SCREEN_X, SCREEN_Y);
+    ctx.drawImage(screen, BEZEL, BEZEL);
     ctx.restore();
     ctx.fillStyle = '#000';
-    roundedRectPath(ctx, FRAME_W / 2 - 60, SCREEN_Y + 12, 120, 34, 17);
+    roundedRectPath(ctx, frameW / 2 - 60, BEZEL + 12, 120, 34, 17);
     ctx.fill();
   } else if (customFrame) {
+    canvas.width = customFrame.canvas.width;
+    canvas.height = customFrame.canvas.height;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     const { x, y, w, h } = customFrame.screenRect;
-    ctx.drawImage(screen, 0, 0, SCREEN_W, SCREEN_H, x, y, w, h);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(x, y, w, h);
+    const fit = fitRect(SCREEN_W, screenH, w, h);
+    ctx.drawImage(screen, x + fit.x, y + fit.y, fit.w, fit.h);
     ctx.drawImage(customFrame.canvas, 0, 0);
   }
+}
+
+// Returns canvas SCREEN_W × fittedCanvas.height with image + edited text overlays.
+function buildScreenCanvas(item) {
+  const c = document.createElement('canvas');
+  c.width = SCREEN_W;
+  c.height = item.fittedCanvas.height;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(item.fittedCanvas, 0, 0);
+  item.textLayers
+    .filter((l) => l.visible && l.edited)
+    .forEach((l) => drawTextOverlay(ctx, l));
+  return c;
+}
+
+// Robust text-overlay draw — handles wider/taller new text + bg/fg contrast guard.
+function drawTextOverlay(ctx, l) {
+  ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
+  const m = ctx.measureText(l.text || ' ');
+  const ascent = m.actualBoundingBoxAscent || (l.fontSize || 14) * 0.8;
+  const descent = m.actualBoundingBoxDescent || (l.fontSize || 14) * 0.25;
+  const newW = m.width;
+  // Anchor to original baseline (bottom of original bbox) so the line of text stays where it was.
+  const baseY = l.y + l.h;
+  const newTop = baseY - ascent;
+  const newBottom = baseY + descent;
+  // Clear an area covering BOTH the original glyph area AND the rendered text area, with padding.
+  const clearX = Math.min(l.x - 2, l.x - 2);
+  const clearY = Math.min(l.y - 2, newTop - 2);
+  const clearW = Math.max(l.w + 4, Math.ceil(newW) + 4);
+  const clearH = Math.max(l.h + 4, Math.ceil(newBottom - newTop) + 4);
+  ctx.fillStyle = l.bgColor || '#ffffff';
+  ctx.fillRect(clearX, clearY, clearW, clearH);
+  // Guard: if text color is too close to bg, fall back to high-contrast color.
+  const fg = ensureContrast(l.color || '#111111', l.bgColor || '#ffffff');
+  ctx.fillStyle = fg;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(l.text || '', l.x, baseY);
+}
+
+function ensureContrast(fg, bg) {
+  const a = parseRgb(fg), b = parseRgb(bg);
+  if (!a || !b) return fg;
+  const la = 0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2];
+  const lb = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2];
+  if (Math.abs(la - lb) < 40) return lb > 128 ? '#111111' : '#ffffff';
+  return fg;
+}
+function parseRgb(s) {
+  if (!s) return null;
+  if (s.startsWith('#')) {
+    const v = s.slice(1);
+    const r = parseInt(v.slice(0, 2), 16);
+    const g = parseInt(v.slice(2, 4), 16);
+    const b = parseInt(v.slice(4, 6), 16);
+    return [r, g, b];
+  }
+  const m = s.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  return m ? [+m[1], +m[2], +m[3]] : null;
+}
+
+// Fit src (sw, sh) inside dst (dw, dh), preserving aspect. Returns {x, y, w, h} inside dst.
+function fitRect(sw, sh, dw, dh) {
+  const sa = sw / sh, da = dw / dh;
+  if (sa > da) {
+    const w = dw, h = w / sa;
+    return { x: 0, y: (dh - h) / 2, w, h };
+  } else {
+    const h = dh, w = h * sa;
+    return { x: (dw - w) / 2, y: 0, w, h };
+  }
+}
+
+function makeIphoneFrameSvg(w, h) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a3d44" />
+      <stop offset="0.5" stop-color="#1f2126" />
+      <stop offset="1" stop-color="#2c2f36" />
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="${w}" height="${h}" rx="48" ry="48" fill="url(#g1)" />
+  <rect x="${BEZEL - 2}" y="${BEZEL - 2}" width="${w - BEZEL * 2 + 4}" height="${h - BEZEL * 2 + 4}" rx="38" ry="38" fill="#0a0a0a" />
+  <rect x="-2" y="160" width="4" height="40" fill="#15171b" rx="1" />
+  <rect x="-2" y="240" width="4" height="68" fill="#15171b" rx="1" />
+  <rect x="-2" y="328" width="4" height="68" fill="#15171b" rx="1" />
+  <rect x="${w - 2}" y="220" width="4" height="100" fill="#15171b" rx="1" />
+</svg>`;
 }
