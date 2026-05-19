@@ -4,15 +4,18 @@ let workerCache = null;
 
 export async function getWorker() {
   if (workerCache) return workerCache;
-  workerCache = await Tesseract.createWorker(['eng', 'kor']);
+  workerCache = await Tesseract.createWorker(['kor', 'eng']);
+  // PSM 6 = uniform block of text — works much better on UI screenshots / mockups
+  // than the default auto (which tends to skip parts of Korean syllable blocks).
+  try {
+    await workerCache.setParameters({ tessedit_pageseg_mode: '6' });
+  } catch {}
   return workerCache;
 }
 
 export async function recognizeImage(src, onProgress) {
   const worker = await getWorker();
-  if (onProgress) {
-    worker.setProgressHandler?.(onProgress);
-  }
+  if (onProgress) worker.setProgressHandler?.(onProgress);
   const { data } = await worker.recognize(src);
   return data;
 }

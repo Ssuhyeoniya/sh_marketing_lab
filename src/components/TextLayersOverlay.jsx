@@ -98,6 +98,7 @@ export default function TextLayersOverlay({
 
 function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseDown, onTextChange, onCommit }) {
   const inputRef = useRef(null);
+  const [hover, setHover] = useState(false);
   useEffect(() => {
     if (isEditing && inputRef.current) {
       inputRef.current.focus();
@@ -105,20 +106,30 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
     }
   }, [isEditing]);
 
-  const border = isEditing
-    ? '2px solid #3b82f6'
-    : isSelected
-    ? '2px solid #3b82f6'
-    : l.edited
-    ? '1px solid rgba(59,130,246,0.65)'
-    : '1px dashed rgba(59,130,246,0.45)';
-  const bg = isSelected && !isEditing ? 'rgba(59,130,246,0.07)' : 'transparent';
+  // Border styles by state — all clearly visible.
+  let border, bg;
+  if (isEditing) {
+    border = '2px solid #3b82f6';
+    bg = 'rgba(59,130,246,0.06)';
+  } else if (isSelected) {
+    border = '2px solid #3b82f6';
+    bg = 'rgba(59,130,246,0.10)';
+  } else if (l.edited) {
+    border = '1.5px solid #3b82f6';
+    bg = 'rgba(59,130,246,0.05)';
+  } else {
+    // Default OCR-detected box: clearly visible cyan outline + light tint.
+    border = hover ? '1.5px solid #06b6d4' : '1.5px dashed #22d3ee';
+    bg = hover ? 'rgba(34,211,238,0.10)' : 'rgba(34,211,238,0.04)';
+  }
 
   return (
     <>
       <div
         onMouseDown={onMouseDown}
-        title={isEditing ? '' : '클릭=선택, 드래그=이동, 더블클릭=텍스트 편집'}
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        title={isEditing ? '' : `"${l.text}" · 클릭=선택 · 드래그=이동 · 더블클릭=편집`}
         style={{
           position: 'absolute',
           left: x,
@@ -130,7 +141,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
           cursor: isEditing ? 'text' : 'move',
           pointerEvents: 'auto',
           boxSizing: 'border-box',
-          transition: 'border-color 0.1s',
+          transition: 'background-color 0.1s, border-color 0.1s',
         }}
       >
         {isEditing && (
@@ -166,13 +177,22 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
           />
         )}
       </div>
-      {isSelected && !isEditing && (
+      {/* Small corner ticks at each corner so very small boxes are still spotted. */}
+      {!isEditing && !isSelected && (
+        <>
+          <CornerTick left={x} top={y} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x + w} top={y} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x} top={y + h} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x + w} top={y + h} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+        </>
+      )}
+      {(isSelected || hover) && !isEditing && (
         <div
           style={{
             position: 'absolute',
             left: x,
             top: Math.max(0, y - 22),
-            background: '#3b82f6',
+            background: isSelected ? '#3b82f6' : '#06b6d4',
             color: '#fff',
             fontSize: 10,
             padding: '2px 6px',
@@ -180,11 +200,33 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
             pointerEvents: 'none',
             fontFamily: 'monospace',
             whiteSpace: 'nowrap',
+            maxWidth: 240,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
           }}
         >
-          {l.text} · {l.fontName || ''} {l.fontSize}px
+          {l.text} · {l.fontSize}px
         </div>
       )}
     </>
+  );
+}
+
+function CornerTick({ left, top, color }) {
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: left - 3,
+        top: top - 3,
+        width: 6,
+        height: 6,
+        background: color,
+        borderRadius: 1,
+        pointerEvents: 'none',
+        boxShadow: '0 0 0 1px rgba(255,255,255,0.6)',
+      }}
+    />
   );
 }

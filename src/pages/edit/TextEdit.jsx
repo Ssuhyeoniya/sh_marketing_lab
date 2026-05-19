@@ -80,35 +80,35 @@ export default function TextEdit() {
     const page = pages[pageIdx];
     if (!page) return;
     const data = await recognizeImage(page.canvas, onProg);
-    const layers = (data.words || [])
-      .filter((w) => {
-        if (!w.text || !w.text.trim()) return false;
-        if (w.confidence < 60) return false;
-        const t = w.text.trim();
-        if (t.length < 2) return false;
-        if (!/[a-zA-Z0-9가-힣]/.test(t)) return false;
-        const bw = w.bbox.x1 - w.bbox.x0;
-        const bh = w.bbox.y1 - w.bbox.y0;
+    // Lines keep multi-syllable Korean intact; fall back to words if lines missing.
+    const items = (data.lines || []).length ? data.lines : (data.words || []);
+    const layers = items
+      .filter((line) => {
+        const text = (line.text || '').trim();
+        if (!text) return false;
+        if ((line.confidence ?? 100) < 30) return false;
+        if (!/[a-zA-Z0-9가-힣]/.test(text)) return false;
+        const bw = line.bbox.x1 - line.bbox.x0;
+        const bh = line.bbox.y1 - line.bbox.y0;
         if (bw < 6 || bh < 6) return false;
-        if (bh > bw * 3 || bw > bh * 25) return false;
         return true;
       })
-      .map((w) => {
-        const g = guessFont(w, page.canvas);
-        const bw = w.bbox.x1 - w.bbox.x0;
-        const bh = w.bbox.y1 - w.bbox.y0;
-        const bg = sampleBg(page.canvas, w.bbox);
-        const fg = sampleFg(page.canvas, w.bbox, bg);
+      .map((line) => {
+        const g = guessFont(line, page.canvas);
+        const bw = line.bbox.x1 - line.bbox.x0;
+        const bh = line.bbox.y1 - line.bbox.y0;
+        const bg = sampleBg(page.canvas, line.bbox);
+        const fg = sampleFg(page.canvas, line.bbox, bg);
         return {
           id: crypto.randomUUID(),
-          text: w.text,
-          originalText: w.text,
-          x: w.bbox.x0,
-          y: w.bbox.y0,
+          text: line.text.trim(),
+          originalText: line.text.trim(),
+          x: line.bbox.x0,
+          y: line.bbox.y0,
           w: bw,
           h: bh,
-          originalX: w.bbox.x0,
-          originalY: w.bbox.y0,
+          originalX: line.bbox.x0,
+          originalY: line.bbox.y0,
           originalW: bw,
           originalH: bh,
           fontFamily: g.font.family,
@@ -178,6 +178,8 @@ export default function TextEdit() {
                 const next = { ...l, ...patch };
                 const EDIT_KEYS = ['text', 'fontFamily', 'fontName', 'fontWeight', 'fontSize', 'color', 'bgColor', 'x', 'y', 'w', 'h'];
                 if (EDIT_KEYS.some((k) => patch[k] !== undefined)) next.edited = true;
+                if ('color' in patch) next.colorEdited = true;
+                if ('bgColor' in patch) next.bgColorEdited = true;
                 return next;
               }),
             }
@@ -368,10 +370,11 @@ export default function TextEdit() {
 function stripExt(s) { return (s || '').replace(/\.[^.]+$/, ''); }
 
 function drawTextOverlay(ctx, l) {
-  ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
+  const fontSize = Math.max(4, Math.min(400, +l.fontSize || 14));
+  const weight = +l.fontWeight || 400;
+  ctx.font = `${weight} ${fontSize}px ${l.fontFamily}`;
   ctx.textBaseline = 'alphabetic';
   const m = ctx.measureText(l.text || ' ');
-  const fontSize = l.fontSize || 14;
   const ascent = m.actualBoundingBoxAscent || fontSize * 0.9;
   const descent = m.actualBoundingBoxDescent || fontSize * 0.3;
   const newW = m.width;
@@ -390,7 +393,8 @@ function drawTextOverlay(ctx, l) {
     Math.max(l.w, Math.ceil(newW)) + PAD * 2,
     Math.max(l.y + l.h, newBottom) - Math.min(l.y, newTop) + PAD * 2,
   );
-  ctx.fillStyle = ensureContrast(l.color || '#111111', bg);
+  const fg = l.colorEdited ? (l.color || '#111111') : ensureContrast(l.color || '#111111', bg);
+  ctx.fillStyle = fg;
   ctx.fillText(l.text || '', l.x, baseY);
 }
 function ensureContrast(fg, bg) {

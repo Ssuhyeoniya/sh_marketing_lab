@@ -52,7 +52,12 @@ export default function IphoneMockup() {
     for (const f of accepted) {
       const url = await fileToDataURL(f);
       const img = await loadImage(url);
-      // Always resize so width matches SCREEN_W (512). Height scales proportionally.
+      // Keep ORIGINAL resolution for OCR (so small UI text is still readable).
+      const originalCanvas = document.createElement('canvas');
+      originalCanvas.width = img.naturalWidth;
+      originalCanvas.height = img.naturalHeight;
+      originalCanvas.getContext('2d').drawImage(img, 0, 0);
+      // Fitted canvas (width = SCREEN_W) is what gets composited into the mockup frame.
       const fitted = await resizeToWidth(img, SCREEN_W);
       next.push({
         id: crypto.randomUUID(),
@@ -60,6 +65,8 @@ export default function IphoneMockup() {
         originalUrl: url,
         originalW: img.naturalWidth,
         originalH: img.naturalHeight,
+        originalCanvas,
+        ocrScale: SCREEN_W / img.naturalWidth, // multiplier: original-space → fitted-space
         fittedCanvas: fitted,
         textLayers: [],
         ocrDone: false,
@@ -103,43 +110,44 @@ export default function IphoneMockup() {
     if (!active) return;
     setBusy(true);
     setOcrProgress(0);
-    const data = await recognizeImage(active.fittedCanvas, (p) => {
+    // Run OCR on ORIGINAL high-res canvas — small UI text becomes recognizable.
+    const ocrCanvas = active.originalCanvas || active.fittedCanvas;
+    const sc = active.ocrScale ?? 1;
+    const data = await recognizeImage(ocrCanvas, (p) => {
       if (p && p.progress != null) setOcrProgress(Math.round(p.progress * 100));
     });
-    const layers = (data.words || [])
-      .filter((w) => {
-        if (!w.text || !w.text.trim()) return false;
-        if (w.confidence < 60) return false;
-        const t = w.text.trim();
-        if (t.length < 2) return false;
-        if (!/[a-zA-Z0-9가-힣]/.test(t)) return false;
-        const bw = w.bbox.x1 - w.bbox.x0;
-        const bh = w.bbox.y1 - w.bbox.y0;
+    // Use LINES (not words) so multi-syllable Korean stays as a single region.
+    const lines = (data.lines || []).length ? data.lines : (data.words || []).map((w) => ({ ...w, text: w.text }));
+    const layers = lines
+      .filter((line) => {
+        const text = (line.text || '').trim();
+        if (!text) return false;
+        if ((line.confidence ?? 100) < 30) return false;
+        if (!/[a-zA-Z0-9가-힣]/.test(text)) return false;
+        const bw = line.bbox.x1 - line.bbox.x0;
+        const bh = line.bbox.y1 - line.bbox.y0;
         if (bw < 6 || bh < 6) return false;
-        if (bh > bw * 3 || bw > bh * 25) return false;
         return true;
       })
-      .map((w) => {
-        const guess = guessFont(w, active.fittedCanvas);
-        const bg = sampleBg(active.fittedCanvas, w.bbox);
-        const fg = sampleFg(active.fittedCanvas, w.bbox, bg);
-        const bw = w.bbox.x1 - w.bbox.x0;
-        const bh = w.bbox.y1 - w.bbox.y0;
+      .map((line) => {
+        // Scale bbox from original-image coords to fitted (SCREEN_W) coords.
+        const ox = Math.round(line.bbox.x0 * sc);
+        const oy = Math.round(line.bbox.y0 * sc);
+        const ow = Math.round((line.bbox.x1 - line.bbox.x0) * sc);
+        const oh = Math.round((line.bbox.y1 - line.bbox.y0) * sc);
+        // guessFont reads bbox at ORIGINAL scale for accurate pixel-density.
+        const guess = guessFont(line, ocrCanvas);
+        const bg = sampleBg(ocrCanvas, line.bbox);
+        const fg = sampleFg(ocrCanvas, line.bbox, bg);
         return {
           id: crypto.randomUUID(),
-          text: w.text,
-          originalText: w.text,
-          x: w.bbox.x0,
-          y: w.bbox.y0,
-          w: bw,
-          h: bh,
-          originalX: w.bbox.x0,
-          originalY: w.bbox.y0,
-          originalW: bw,
-          originalH: bh,
+          text: line.text.trim(),
+          originalText: line.text.trim(),
+          x: ox, y: oy, w: ow, h: oh,
+          originalX: ox, originalY: oy, originalW: ow, originalH: oh,
           fontFamily: guess.font.family,
           fontName: guess.font.name,
-          fontSize: guess.size,
+          fontSize: Math.max(6, Math.round(guess.size * sc)),
           fontWeight: guess.weight,
           color: fg,
           bgColor: bg,
@@ -164,9 +172,11 @@ export default function IphoneMockup() {
               textLayers: x.textLayers.map((l) => {
                 if (l.id !== lid) return l;
                 const next = { ...l, ...patch };
-                // Any meaningful change marks the layer as edited → canvas overlay renders.
                 const EDIT_KEYS = ['text', 'fontFamily', 'fontName', 'fontWeight', 'fontSize', 'color', 'bgColor', 'x', 'y', 'w', 'h'];
                 if (EDIT_KEYS.some((k) => patch[k] !== undefined)) next.edited = true;
+                // Track whether color/bg were manually set so we don't override later.
+                if ('color' in patch) next.colorEdited = true;
+                if ('bgColor' in patch) next.bgColorEdited = true;
                 return next;
               }),
             }
@@ -735,36 +745,29 @@ function FrameUploadButton({ onUpload, active }) {
 function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectChange, selectedLayerId, onSelectLayer, onUpdateLayer }) {
   const ref = useRef(null);
   const wrapRef = useRef(null);
-  const [scale, setScale] = useState(0.55);
+  // actualScale is the EFFECTIVE displayed scale (canvas.clientWidth / canvas.width).
+  // It changes only when the canvas physically resizes (e.g. narrow viewport hits maxWidth:100%).
+  // It does NOT change with browser zoom — so browser zoom enlarges everything via CSS, naturally.
+  const [actualScale, setActualScale] = useState(0.5);
 
-  // Frame intrinsic dimensions — SVG stretches per item to fit long screenshots.
   const screenH = item ? item.fittedCanvas.height : SCREEN_H;
   const frameW = frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W;
   const frameH = frameMode === 'svg' ? screenH + BEZEL * 2 : customFrame?.canvas.height || FRAME_H;
 
-  // Observe the canvas-area container; recompute scale to fit available space.
+  // Fixed default CSS display width — browser zoom (Ctrl++/--) scales naturally on top of this.
+  const DEFAULT_DISP_W = 540;
+  const cssW = Math.min(DEFAULT_DISP_W, frameW);
+
   useEffect(() => {
-    const wrap = wrapRef.current;
-    if (!wrap) return;
-    const host = wrap.parentElement; // .canvas-area
-    if (!host) return;
+    const c = ref.current;
+    if (!c) return;
     const update = () => {
-      const cs = getComputedStyle(host);
-      const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
-      const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
-      const availW = Math.max(120, host.clientWidth - padX);
-      const availH = Math.max(120, host.clientHeight - padY);
-      const sw = availW / frameW;
-      const sh = availH / frameH;
-      // Fill available space — allow upscaling above native (cap at 3x to keep things sane).
-      const s = Math.max(0.15, Math.min(sw, sh, 3));
-      setScale(s);
+      if (c.width > 0 && c.clientWidth > 0) setActualScale(c.clientWidth / c.width);
     };
     update();
     const ro = new ResizeObserver(update);
-    ro.observe(host);
-    window.addEventListener('resize', update);
-    return () => { ro.disconnect(); window.removeEventListener('resize', update); };
+    ro.observe(c);
+    return () => ro.disconnect();
   }, [frameW, frameH]);
 
   useEffect(() => {
@@ -772,8 +775,7 @@ function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectC
     drawPreview(ref.current, item, frameMode, customFrame);
   }, [item, frameMode, customFrame]);
 
-  const dispW = frameW * scale;
-  const dispH = frameH * scale;
+  const scale = actualScale; // used for overlay coordinate transforms
 
   return (
     <div ref={wrapRef} style={{ position: 'relative', display: 'inline-block' }}>
@@ -782,8 +784,10 @@ function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectC
         width={frameW}
         height={frameH}
         style={{
-          width: dispW,
-          height: dispH,
+          width: cssW,
+          maxWidth: '100%',
+          height: 'auto',
+          aspectRatio: `${frameW} / ${frameH}`,
           display: 'block',
           filter: 'drop-shadow(0 12px 32px rgba(0,0,0,0.18))',
         }}
@@ -1172,15 +1176,13 @@ function buildScreenCanvas(item) {
   return c;
 }
 
-// Robust text-overlay draw — handles repositioned layers.
-// 1) Clear ORIGINAL bbox (so a moved layer doesn't leave a ghost in its original spot)
-// 2) Clear NEW text bbox (might overlap original; both cleared = single visual rect)
-// 3) Draw new text at the layer's current x/y with baseline anchored to its current bottom.
 function drawTextOverlay(ctx, l) {
-  ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
+  // Clamp fontSize defensively so empty/zero/negative inputs never make text invisible.
+  const fontSize = Math.max(4, Math.min(400, +l.fontSize || 14));
+  const weight = +l.fontWeight || 400;
+  ctx.font = `${weight} ${fontSize}px ${l.fontFamily}`;
   ctx.textBaseline = 'alphabetic';
   const m = ctx.measureText(l.text || ' ');
-  const fontSize = l.fontSize || 14;
   const ascent = m.actualBoundingBoxAscent || fontSize * 0.9;
   const descent = m.actualBoundingBoxDescent || fontSize * 0.3;
   const newW = m.width;
@@ -1190,18 +1192,18 @@ function drawTextOverlay(ctx, l) {
   const PAD = 3;
   const bg = l.bgColor || '#ffffff';
   ctx.fillStyle = bg;
-  // Original spot (only fill if it differs from new position to avoid waste)
   const ox = l.originalX ?? l.x, oy = l.originalY ?? l.y;
   const ow = l.originalW ?? l.w, oh = l.originalH ?? l.h;
   ctx.fillRect(ox - PAD, oy - PAD, ow + PAD * 2, oh + PAD * 2);
-  // New text bounds (covers both upscale/downscale + width change)
   ctx.fillRect(
     l.x - PAD,
     Math.min(l.y, newTop) - PAD,
     Math.max(l.w, Math.ceil(newW)) + PAD * 2,
     Math.max(l.y + l.h, newBottom) - Math.min(l.y, newTop) + PAD * 2,
   );
-  ctx.fillStyle = ensureContrast(l.color || '#111111', bg);
+  // Trust user's explicit color choice. Only auto-contrast for un-edited (OCR-sampled) colors.
+  const fg = l.colorEdited ? (l.color || '#111111') : ensureContrast(l.color || '#111111', bg);
+  ctx.fillStyle = fg;
   ctx.fillText(l.text || '', l.x, baseY);
 }
 
