@@ -16,6 +16,7 @@ import {
 } from './IphoneFrame';
 import { downloadBlob } from '../../utils/pdf';
 import { useFontsReady } from '../../utils/fonts';
+import TextLayersOverlay from '../../components/TextLayersOverlay';
 
 const MAX_IMAGES = 20;
 
@@ -30,6 +31,7 @@ export default function IphoneMockup() {
   const [showRectEditor, setShowRectEditor] = useState(false);
   const [aspectLocked, setAspectLocked] = useState(true);
   const fontsTick = useFontsReady();
+  const [selectedLayerId, setSelectedLayerId] = useState(null);
 
   const active = items.find((i) => i.id === activeId);
   const step = items.length === 0 ? 0 : !active?.ocrDone ? 1 : 2;
@@ -120,14 +122,20 @@ export default function IphoneMockup() {
         const guess = guessFont(w, active.fittedCanvas);
         const bg = sampleBg(active.fittedCanvas, w.bbox);
         const fg = sampleFg(active.fittedCanvas, w.bbox, bg);
+        const bw = w.bbox.x1 - w.bbox.x0;
+        const bh = w.bbox.y1 - w.bbox.y0;
         return {
           id: crypto.randomUUID(),
           text: w.text,
           originalText: w.text,
           x: w.bbox.x0,
           y: w.bbox.y0,
-          w: w.bbox.x1 - w.bbox.x0,
-          h: w.bbox.y1 - w.bbox.y0,
+          w: bw,
+          h: bh,
+          originalX: w.bbox.x0,
+          originalY: w.bbox.y0,
+          originalW: bw,
+          originalH: bh,
           fontFamily: guess.font.family,
           fontName: guess.font.name,
           fontSize: guess.size,
@@ -467,6 +475,9 @@ export default function IphoneMockup() {
                 customFrame={customFrame}
                 aspectLocked={aspectLocked}
                 onScreenRectChange={(r) => updateScreenRect(r)}
+                selectedLayerId={selectedLayerId}
+                onSelectLayer={setSelectedLayerId}
+                onUpdateLayer={updateLayer}
               />
             ) : (
               <div className="empty-hero">
@@ -731,7 +742,7 @@ function FrameUploadButton({ onUpload, active }) {
   );
 }
 
-function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectChange }) {
+function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectChange, selectedLayerId, onSelectLayer, onUpdateLayer }) {
   const ref = useRef(null);
   const wrapRef = useRef(null);
   const [scale, setScale] = useState(0.55);
@@ -798,6 +809,34 @@ function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectC
           onChange={onScreenRectChange}
         />
       )}
+      {item && onUpdateLayer && (() => {
+        // Compute where the SCREEN image sits within the displayed frame canvas.
+        let offX, offY, inner;
+        if (frameMode === 'svg') {
+          offX = BEZEL * scale;
+          offY = BEZEL * scale;
+          inner = scale; // screen 1:1 inside frame
+        } else if (customFrame) {
+          const sr = customFrame.screenRect;
+          const fit = fitRect(SCREEN_W, item.fittedCanvas.height, sr.w, sr.h);
+          offX = (sr.x + fit.x) * scale;
+          offY = (sr.y + fit.y) * scale;
+          inner = (fit.w / SCREEN_W) * scale;
+        } else {
+          offX = 0; offY = 0; inner = scale;
+        }
+        return (
+          <TextLayersOverlay
+            layers={item.textLayers}
+            offsetX={offX}
+            offsetY={offY}
+            scale={inner}
+            selectedId={selectedLayerId}
+            onSelect={onSelectLayer}
+            onUpdate={onUpdateLayer}
+          />
+        );
+      })()}
     </div>
   );
 }
@@ -1143,7 +1182,10 @@ function buildScreenCanvas(item) {
   return c;
 }
 
-// Robust text-overlay draw — clears the union of original bbox and new-text bbox.
+// Robust text-overlay draw — handles repositioned layers.
+// 1) Clear ORIGINAL bbox (so a moved layer doesn't leave a ghost in its original spot)
+// 2) Clear NEW text bbox (might overlap original; both cleared = single visual rect)
+// 3) Draw new text at the layer's current x/y with baseline anchored to its current bottom.
 function drawTextOverlay(ctx, l) {
   ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
   ctx.textBaseline = 'alphabetic';
@@ -1152,19 +1194,24 @@ function drawTextOverlay(ctx, l) {
   const ascent = m.actualBoundingBoxAscent || fontSize * 0.9;
   const descent = m.actualBoundingBoxDescent || fontSize * 0.3;
   const newW = m.width;
-  // Anchor to ORIGINAL baseline so line position stays where it was.
   const baseY = l.y + l.h;
   const newTop = baseY - ascent;
   const newBottom = baseY + descent;
-  // Clear area = union of (original bbox) and (new-text bbox), with padding.
   const PAD = 3;
-  const clearLeft = l.x - PAD;
-  const clearRight = Math.max(l.x + l.w, l.x + newW) + PAD;
-  const clearTop = Math.min(l.y, newTop) - PAD;
-  const clearBottom = Math.max(l.y + l.h, newBottom) + PAD;
-  ctx.fillStyle = l.bgColor || '#ffffff';
-  ctx.fillRect(clearLeft, clearTop, clearRight - clearLeft, clearBottom - clearTop);
-  ctx.fillStyle = ensureContrast(l.color || '#111111', l.bgColor || '#ffffff');
+  const bg = l.bgColor || '#ffffff';
+  ctx.fillStyle = bg;
+  // Original spot (only fill if it differs from new position to avoid waste)
+  const ox = l.originalX ?? l.x, oy = l.originalY ?? l.y;
+  const ow = l.originalW ?? l.w, oh = l.originalH ?? l.h;
+  ctx.fillRect(ox - PAD, oy - PAD, ow + PAD * 2, oh + PAD * 2);
+  // New text bounds (covers both upscale/downscale + width change)
+  ctx.fillRect(
+    l.x - PAD,
+    Math.min(l.y, newTop) - PAD,
+    Math.max(l.w, Math.ceil(newW)) + PAD * 2,
+    Math.max(l.y + l.h, newBottom) - Math.min(l.y, newTop) + PAD * 2,
+  );
+  ctx.fillStyle = ensureContrast(l.color || '#111111', bg);
   ctx.fillText(l.text || '', l.x, baseY);
 }
 

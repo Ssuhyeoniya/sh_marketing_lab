@@ -5,6 +5,7 @@ import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
 import { recognizeImage, guessFont } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob } from '../../utils/pdf';
 import { useFontsReady } from '../../utils/fonts';
+import TextLayersOverlay from '../../components/TextLayersOverlay';
 
 const FONT_OPTIONS = [
   { name: 'SF Pro', family: '-apple-system, BlinkMacSystemFont, sans-serif', weight: 400 },
@@ -30,6 +31,23 @@ export default function TextEdit() {
 
   const current = pages[currentIdx];
   const fontsTick = useFontsReady();
+  const [selectedLayerId, setSelectedLayerId] = useState(null);
+  const [dispScale, setDispScale] = useState(1);
+  const wrapRef = useRef(null);
+
+  // Track canvas display size for overlay coord conversion.
+  useEffect(() => {
+    const c = previewRef.current;
+    if (!c) return;
+    const update = () => {
+      if (c.width > 0) setDispScale(c.clientWidth / c.width);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(c);
+    window.addEventListener('resize', update);
+    return () => { ro.disconnect(); window.removeEventListener('resize', update); };
+  }, [current]);
 
   const onFiles = async (fs) => {
     const f = fs[0];
@@ -87,20 +105,28 @@ export default function TextEdit() {
       })
       .map((w) => {
         const g = guessFont(w, page.canvas);
+        const bw = w.bbox.x1 - w.bbox.x0;
+        const bh = w.bbox.y1 - w.bbox.y0;
+        const bg = sampleBg(page.canvas, w.bbox);
+        const fg = sampleFg(page.canvas, w.bbox, bg);
         return {
           id: crypto.randomUUID(),
           text: w.text,
           originalText: w.text,
           x: w.bbox.x0,
           y: w.bbox.y0,
-          w: w.bbox.x1 - w.bbox.x0,
-          h: w.bbox.y1 - w.bbox.y0,
+          w: bw,
+          h: bh,
+          originalX: w.bbox.x0,
+          originalY: w.bbox.y0,
+          originalW: bw,
+          originalH: bh,
           fontFamily: g.font.family,
           fontName: g.font.name,
           fontSize: g.size,
           fontWeight: g.weight,
-          color: (() => { const bg = sampleBg(page.canvas, w.bbox); return sampleFg(page.canvas, w.bbox, bg); })(),
-          bgColor: sampleBg(page.canvas, w.bbox),
+          color: fg,
+          bgColor: bg,
           visible: true,
           edited: false,
         };
@@ -266,6 +292,11 @@ export default function TextEdit() {
         <div className="canvas-toolbar">
           <div style={{ fontSize: 13, fontWeight: 600 }}>
             {current ? `Page ${current.pageNum} / ${pages.length}` : '미리보기'}
+            {current?.ocrDone && (
+              <span style={{ marginLeft: 10, fontSize: 11, fontWeight: 400, color: 'var(--text-muted)' }}>
+                · 클릭=선택 · 드래그=이동 · 더블클릭=편집
+              </span>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
             <button className="btn sm" disabled={!current} onClick={exportCurrentPng}>현재 PNG</button>
@@ -276,7 +307,27 @@ export default function TextEdit() {
         </div>
         <div className="canvas-area">
           {current ? (
-            <canvas ref={previewRef} style={{ maxWidth: '100%', maxHeight: '100%', border: '1px solid var(--border)', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }} />
+            <div ref={wrapRef} style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
+              <canvas
+                ref={previewRef}
+                style={{
+                  maxWidth: '100%',
+                  height: 'auto',
+                  display: 'block',
+                  border: '1px solid var(--border)',
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.08)',
+                }}
+              />
+              {current.ocrDone && (
+                <TextLayersOverlay
+                  layers={current.layers}
+                  scale={dispScale}
+                  selectedId={selectedLayerId}
+                  onSelect={setSelectedLayerId}
+                  onUpdate={(id, patch) => update(id, patch)}
+                />
+              )}
+            </div>
           ) : (
             <div className="empty-hero"><div className="big">✎</div><h2>텍스트 편집</h2><p>이미지 또는 PDF를 업로드해 텍스트를 인식하고 동일 폰트로 수정하세요. PDF는 전체 페이지 자동 처리.</p></div>
           )}
@@ -337,13 +388,18 @@ function drawTextOverlay(ctx, l) {
   const newTop = baseY - ascent;
   const newBottom = baseY + descent;
   const PAD = 3;
-  const clearLeft = l.x - PAD;
-  const clearRight = Math.max(l.x + l.w, l.x + newW) + PAD;
-  const clearTop = Math.min(l.y, newTop) - PAD;
-  const clearBottom = Math.max(l.y + l.h, newBottom) + PAD;
-  ctx.fillStyle = l.bgColor || '#ffffff';
-  ctx.fillRect(clearLeft, clearTop, clearRight - clearLeft, clearBottom - clearTop);
-  ctx.fillStyle = ensureContrast(l.color || '#111111', l.bgColor || '#ffffff');
+  const bg = l.bgColor || '#ffffff';
+  ctx.fillStyle = bg;
+  const ox = l.originalX ?? l.x, oy = l.originalY ?? l.y;
+  const ow = l.originalW ?? l.w, oh = l.originalH ?? l.h;
+  ctx.fillRect(ox - PAD, oy - PAD, ow + PAD * 2, oh + PAD * 2);
+  ctx.fillRect(
+    l.x - PAD,
+    Math.min(l.y, newTop) - PAD,
+    Math.max(l.w, Math.ceil(newW)) + PAD * 2,
+    Math.max(l.y + l.h, newBottom) - Math.min(l.y, newTop) + PAD * 2,
+  );
+  ctx.fillStyle = ensureContrast(l.color || '#111111', bg);
   ctx.fillText(l.text || '', l.x, baseY);
 }
 function ensureContrast(fg, bg) {
