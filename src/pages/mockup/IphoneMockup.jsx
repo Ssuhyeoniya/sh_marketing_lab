@@ -730,21 +730,49 @@ function FrameUploadButton({ onUpload, active }) {
 
 function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectChange }) {
   const ref = useRef(null);
+  const wrapRef = useRef(null);
+  const [scale, setScale] = useState(0.55);
+
+  // Frame intrinsic dimensions — SVG stretches per item to fit long screenshots.
+  const screenH = item ? item.fittedCanvas.height : SCREEN_H;
+  const frameW = frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W;
+  const frameH = frameMode === 'svg' ? screenH + BEZEL * 2 : customFrame?.canvas.height || FRAME_H;
+
+  // Observe the canvas-area container; recompute scale to fit available space.
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const host = wrap.parentElement; // .canvas-area
+    if (!host) return;
+    const update = () => {
+      const cs = getComputedStyle(host);
+      const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+      const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+      const availW = Math.max(120, host.clientWidth - padX);
+      const availH = Math.max(120, host.clientHeight - padY);
+      const sw = availW / frameW;
+      const sh = availH / frameH;
+      // Use whichever is more restrictive, but cap at 1.0 (don't upscale beyond native)
+      const s = Math.max(0.1, Math.min(sw, sh, 1.0));
+      setScale(s);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(host);
+    window.addEventListener('resize', update);
+    return () => { ro.disconnect(); window.removeEventListener('resize', update); };
+  }, [frameW, frameH]);
+
   useEffect(() => {
     if (!ref.current) return;
     drawPreview(ref.current, item, frameMode, customFrame);
   }, [item, frameMode, customFrame]);
 
-  const previewScale = 0.55;
-  // In SVG mode the frame stretches to fit a tall image — compute per active item.
-  const screenH = item ? item.fittedCanvas.height : SCREEN_H;
-  const frameW = frameMode === 'svg' ? FRAME_W : customFrame?.canvas.width || FRAME_W;
-  const frameH = frameMode === 'svg' ? screenH + BEZEL * 2 : customFrame?.canvas.height || FRAME_H;
-  const dispW = frameW * previewScale;
-  const dispH = frameH * previewScale;
+  const dispW = frameW * scale;
+  const dispH = frameH * scale;
 
   return (
-    <div style={{ position: 'relative', display: 'inline-block' }}>
+    <div ref={wrapRef} style={{ position: 'relative', display: 'inline-block' }}>
       <canvas
         ref={ref}
         width={frameW}
@@ -761,7 +789,7 @@ function PreviewArea({ item, frameMode, customFrame, aspectLocked, onScreenRectC
           rect={customFrame.screenRect}
           frameW={frameW}
           frameH={frameH}
-          scale={previewScale}
+          scale={scale}
           aspectLocked={aspectLocked}
           anchors={customFrame.anchors}
           onChange={onScreenRectChange}

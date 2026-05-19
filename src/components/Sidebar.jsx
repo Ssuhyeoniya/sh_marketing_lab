@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { navConfig, findNavMeta } from '../navConfig';
 
-export default function Sidebar() {
+export default function Sidebar({ mobileOpen }) {
   const location = useLocation();
   const meta = findNavMeta(location.pathname);
   const initialOpen = navConfig.reduce((acc, c) => {
@@ -12,7 +12,7 @@ export default function Sidebar() {
   const [open, setOpen] = useState(initialOpen);
 
   return (
-    <aside className="sidebar">
+    <aside className={'sidebar' + (mobileOpen ? ' mobile-open' : '')}>
       <NavLink to="/" className="brand" style={{ display: 'block' }}>
         ⚡ SH Marketing Lab
       </NavLink>
