@@ -4,6 +4,7 @@ import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
 import { recognizeImage, guessFont } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob } from '../../utils/pdf';
+import { useFontsReady } from '../../utils/fonts';
 
 const FONT_OPTIONS = [
   { name: 'SF Pro', family: '-apple-system, BlinkMacSystemFont, sans-serif', weight: 400 },
@@ -28,6 +29,7 @@ export default function TextEdit() {
   const previewRef = useRef(null);
 
   const current = pages[currentIdx];
+  const fontsTick = useFontsReady();
 
   const onFiles = async (fs) => {
     const f = fs[0];
@@ -146,7 +148,7 @@ export default function TextEdit() {
     const ctx = c.getContext('2d');
     ctx.drawImage(current.canvas, 0, 0);
     current.layers.filter((l) => l.visible && l.edited).forEach((l) => drawTextOverlay(ctx, l));
-  }, [current, currentIdx, pages]);
+  }, [current, currentIdx, pages, fontsTick]);
 
   const update = (id, patch) => {
     setPages((ps) =>
@@ -325,22 +327,23 @@ function stripExt(s) { return (s || '').replace(/\.[^.]+$/, ''); }
 
 function drawTextOverlay(ctx, l) {
   ctx.font = `${l.fontWeight || 400} ${l.fontSize || 14}px ${l.fontFamily}`;
+  ctx.textBaseline = 'alphabetic';
   const m = ctx.measureText(l.text || ' ');
-  const ascent = m.actualBoundingBoxAscent || (l.fontSize || 14) * 0.8;
-  const descent = m.actualBoundingBoxDescent || (l.fontSize || 14) * 0.25;
+  const fontSize = l.fontSize || 14;
+  const ascent = m.actualBoundingBoxAscent || fontSize * 0.9;
+  const descent = m.actualBoundingBoxDescent || fontSize * 0.3;
   const newW = m.width;
   const baseY = l.y + l.h;
   const newTop = baseY - ascent;
   const newBottom = baseY + descent;
-  const clearX = l.x - 2;
-  const clearY = Math.min(l.y - 2, newTop - 2);
-  const clearW = Math.max(l.w + 4, Math.ceil(newW) + 4);
-  const clearH = Math.max(l.h + 4, Math.ceil(newBottom - newTop) + 4);
+  const PAD = 3;
+  const clearLeft = l.x - PAD;
+  const clearRight = Math.max(l.x + l.w, l.x + newW) + PAD;
+  const clearTop = Math.min(l.y, newTop) - PAD;
+  const clearBottom = Math.max(l.y + l.h, newBottom) + PAD;
   ctx.fillStyle = l.bgColor || '#ffffff';
-  ctx.fillRect(clearX, clearY, clearW, clearH);
-  const fg = ensureContrast(l.color || '#111111', l.bgColor || '#ffffff');
-  ctx.fillStyle = fg;
-  ctx.textBaseline = 'alphabetic';
+  ctx.fillRect(clearLeft, clearTop, clearRight - clearLeft, clearBottom - clearTop);
+  ctx.fillStyle = ensureContrast(l.color || '#111111', l.bgColor || '#ffffff');
   ctx.fillText(l.text || '', l.x, baseY);
 }
 function ensureContrast(fg, bg) {
