@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
-import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain } from '../../utils/ocr';
+import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob, extractPageTextItems } from '../../utils/pdf';
 import { PDFDocument } from 'pdf-lib';
 import { useFontsReady } from '../../utils/fonts';
@@ -249,14 +249,17 @@ export default function TextEdit() {
               letterSpacing = delta;
             }
           }
+          // Frame padding for clickability — keep originalX/Y/W/H tight so
+          // glyph erase / lift / baseline math run against the actual ink.
+          const PAD = 3;
           return {
             id: crypto.randomUUID(),
             text: it.text,
             originalText: it.text,
-            x: it.x,
-            y: it.y,
-            w: it.w,
-            h: it.h,
+            x: it.x - PAD,
+            y: it.y - PAD,
+            w: it.w + PAD * 2,
+            h: it.h + PAD * 2,
             originalX: it.x,
             originalY: it.y,
             originalW: it.w,
@@ -294,101 +297,89 @@ export default function TextEdit() {
 
     // Fallback: rasterized OCR for scans / image-only PDFs / images.
     onProg?.({ stage: 'Tesseract OCR 인식 중' });
-    const data = await recognizeImage(page.canvas, onProg);
+    // Line-suppressed copy of the page canvas — table borders masked out so
+    // text crossing or hugging a rule doesn't get clipped by Tesseract. The
+    // original canvas is preserved for colour sampling and final rendering.
+    const ocrInput = suppressTableLines(page.canvas);
+    const data = await recognizeImage(ocrInput, onProg);
 
-    // Hybrid line + word strategy:
-    //   - Detect font metrics (size, weight, color, …) on the LINE because
-    //     line bboxes encompass full ascender→descender extent and give a
-    //     stable height. Word bboxes only hug the actual glyph extent, so
-    //     "ace" comes out short and "Tag" tall — that was the source of the
-    //     "font size broken per-word" regression.
-    //   - Emit a LAYER per word, using its own bbox for position/width but
-    //     inheriting font properties from its parent line so all words on a
-    //     line share the same typography. If a line has no word array
-    //     (dense Korean), fall back to one layer for the whole line.
+    // Sentence-level grouping: one layer per LINE. Tesseract gives `lines`
+    // already at sentence/visual-line granularity, which is what the user
+    // edits as a unit. Word-level access is still available via the "단어 수정"
+    // mode in the canvas toolbar — that mode estimates the clicked-word
+    // boundary inside the line and pre-selects it in the input. This avoids
+    // over-fragmenting the document into one-frame-per-word.
     const lines = data.lines || [];
     const layers = [];
+    const PAD = 3; // visual breathing room around the bbox
     for (const line of lines) {
-      const lineText = (line.text || '').trim();
-      if (!lineText) continue;
+      const text = (line.text || '').trim();
+      if (!text) continue;
       if ((line.confidence ?? 100) < 30) continue;
-      if (!/[a-zA-Z0-9가-힣]/.test(lineText)) continue;
+      if (!/[a-zA-Z0-9가-힣]/.test(text)) continue;
       const lbw = line.bbox.x1 - line.bbox.x0;
       const lbh = line.bbox.y1 - line.bbox.y0;
       if (lbw < 6 || lbh < 6) continue;
 
-      // Line-level font metric — computed ONCE, shared by every word.
       const g = guessFont(line, page.canvas);
-      const lineBg = sampleBg(page.canvas, line.bbox);
-      const lineFg = sampleFg(page.canvas, line.bbox, lineBg);
-      const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(lineText);
+      const bg = sampleBg(page.canvas, line.bbox);
+      const fg = sampleFg(page.canvas, line.bbox, bg);
+      const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(text);
       const fontFamily = buildFontFamilyChain({
         pdfFamily: '',
         matchedFontFamily: g.font.family,
         isKorean,
         kind: g.font.kind || 'sans',
       });
-
-      // Words within the line. Tesseract puts them on `line.words`; when
-      // it's missing we synthesise a single word covering the full line.
-      const words = (line.words && line.words.length) ? line.words : [{
-        text: lineText, bbox: line.bbox, confidence: line.confidence,
-      }];
-
-      for (const word of words) {
-        const wt = (word.text || '').trim();
-        if (!wt) continue;
-        const wbw = word.bbox.x1 - word.bbox.x0;
-        const wbh = word.bbox.y1 - word.bbox.y0;
-        if (wbw < 3 || wbh < 3) continue;
-
-        // Letter-spacing per-word using its own bbox + the line's font.
-        let letterSpacing = 0;
-        if (wt.length > 1 && typeof document !== 'undefined') {
-          const mctx = document.createElement('canvas').getContext('2d');
-          mctx.font = `${g.weight} ${g.size}px ${fontFamily}`;
-          const native = mctx.measureText(wt).width;
-          const delta = (wbw - native) / (wt.length - 1);
-          if (isFinite(delta) && Math.abs(delta) < g.size * 0.4) letterSpacing = delta;
-        }
-
-        layers.push({
-          id: crypto.randomUUID(),
-          text: wt,
-          originalText: wt,
-          // Bbox: word for position/width; LINE-derived for height so the
-          // frame matches the visual line, not just the glyph extent of
-          // this particular word. Keeps ascender/descender aligned across
-          // a line and prevents per-word size jitter.
-          x: word.bbox.x0,
-          y: line.bbox.y0,
-          w: wbw,
-          h: lbh,
-          originalX: word.bbox.x0,
-          originalY: line.bbox.y0,
-          originalW: wbw,
-          originalH: lbh,
-          baseY: line.bbox.y1,
-          ascent: lbh * 0.82,
-          descent: lbh * 0.18,
-          angleDeg: 0,
-          skewXDeg: g.isItalic ? 10 : 0,
-          letterSpacing,
-          lineHeight: g.size,
-          pdfFamily: '',
-          fontFamily,
-          fontName: g.font.name,
-          fontSize: g.size,
-          fontWeight: g.weight,
-          isBold: !!g.isBold,
-          isItalic: !!g.isItalic,
-          color: lineFg,
-          bgColor: lineBg,
-          visible: true,
-          edited: false,
-          source: 'ocr',
-        });
+      let letterSpacing = 0;
+      if (text.length > 1 && typeof document !== 'undefined') {
+        const mctx = document.createElement('canvas').getContext('2d');
+        mctx.font = `${g.weight} ${g.size}px ${fontFamily}`;
+        const native = mctx.measureText(text).width;
+        const delta = (lbw - native) / (text.length - 1);
+        if (isFinite(delta) && Math.abs(delta) < g.size * 0.4) letterSpacing = delta;
       }
+      // Slight bbox expansion: gives the user breathing room when clicking
+      // tight cells. originalX/Y/W/H stays tight so glyph erase / lift
+      // happens against the actual ink footprint.
+      layers.push({
+        id: crypto.randomUUID(),
+        text,
+        originalText: text,
+        x: line.bbox.x0 - PAD,
+        y: line.bbox.y0 - PAD,
+        w: lbw + PAD * 2,
+        h: lbh + PAD * 2,
+        originalX: line.bbox.x0,
+        originalY: line.bbox.y0,
+        originalW: lbw,
+        originalH: lbh,
+        baseY: line.bbox.y1,
+        ascent: lbh * 0.82,
+        descent: lbh * 0.18,
+        angleDeg: 0,
+        skewXDeg: g.isItalic ? 10 : 0,
+        letterSpacing,
+        lineHeight: g.size,
+        pdfFamily: '',
+        fontFamily,
+        fontName: g.font.name,
+        fontSize: g.size,
+        fontWeight: g.weight,
+        isBold: !!g.isBold,
+        isItalic: !!g.isItalic,
+        color: fg,
+        bgColor: bg,
+        // Internal word-list so 단어 수정 mode can offer per-word selection
+        // without paying the cost of a separate layer per word.
+        words: (line.words || []).map((w) => ({
+          text: (w.text || '').trim(),
+          bbox: w.bbox,
+        })),
+        visible: true,
+        edited: false,
+        source: 'ocr',
+      });
     }
     setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers, ocrDone: true } : p)));
   };

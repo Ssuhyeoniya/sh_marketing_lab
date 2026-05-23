@@ -175,21 +175,37 @@ export default function TextLayersOverlay({
               }
               if (editMode === 'word') {
                 onSelect?.(l.id);
-                // Estimate the clicked character index from the X position
-                // within the layer's bounding rect, then expand to the
-                // surrounding word so retyping replaces only that word.
                 const cRect = e.currentTarget.getBoundingClientRect();
                 const relClickX = e.clientX - cRect.left;
                 const text = l.text || '';
-                const isWordCh = (ch) => /[\p{L}\p{N}_가-힣]/u.test(ch);
-                const approxIdx = Math.max(
-                  0,
-                  Math.min(text.length, Math.round((relClickX / cRect.width) * text.length))
-                );
-                let s = approxIdx, end = approxIdx;
-                while (s > 0 && isWordCh(text[s - 1])) s--;
-                while (end < text.length && isWordCh(text[end])) end++;
-                const sel = s === end ? [0, text.length] : [s, end];
+                let sel = null;
+                // Best: use OCR-detected word bboxes when present — they
+                // were captured from Tesseract per-word boxes inside the
+                // line and give pixel-accurate boundaries.
+                if (l.words && l.words.length && l.originalW) {
+                  const px = (relClickX / cRect.width) * l.originalW; // tight-bbox px
+                  const baseX = 0; // offsets are relative to layer's originalX
+                  const clickAbsX = (l.originalX ?? l.x) + px;
+                  const hit = l.words.find((w) =>
+                    w.bbox && clickAbsX >= w.bbox.x0 - 2 && clickAbsX <= w.bbox.x1 + 2
+                  );
+                  if (hit && hit.text) {
+                    const idx = text.indexOf(hit.text);
+                    if (idx >= 0) sel = [idx, idx + hit.text.length];
+                  }
+                }
+                // Fallback: proportional click-to-char with word-boundary expand.
+                if (!sel) {
+                  const isWordCh = (ch) => /[\p{L}\p{N}_가-힣]/u.test(ch);
+                  const approxIdx = Math.max(
+                    0,
+                    Math.min(text.length, Math.round((relClickX / cRect.width) * text.length))
+                  );
+                  let s = approxIdx, end = approxIdx;
+                  while (s > 0 && isWordCh(text[s - 1])) s--;
+                  while (end < text.length && isWordCh(text[end])) end++;
+                  sel = s === end ? [0, text.length] : [s, end];
+                }
                 onMutateStart?.();
                 setEditingCaret(sel);
                 setEditingId(l.id);
