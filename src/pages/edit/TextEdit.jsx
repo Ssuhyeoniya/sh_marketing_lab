@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
-import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines } from '../../utils/ocr';
+import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob, extractPageTextItems } from '../../utils/pdf';
 import { PDFDocument } from 'pdf-lib';
 import { useFontsReady } from '../../utils/fonts';
@@ -228,14 +228,27 @@ export default function TextEdit() {
             originalWidthPx: it.w,
             fontSizePx: it.fontSize,
           });
-          const bbox = {
+          const rawBBox = {
             x0: Math.max(0, Math.floor(it.x)),
             y0: Math.max(0, Math.floor(it.y)),
             x1: Math.min(page.canvas.width, Math.ceil(it.x + it.w)),
             y1: Math.min(page.canvas.height, Math.ceil(it.y + it.h)),
           };
+          // Glyph-tight bbox: scan ink pixels and crop to the true visible
+          // glyph extent. PDFs commonly emit boxes spanning the full em
+          // height (ascent + descent + leading), which is much taller than
+          // the rendered glyphs for Korean text and for Latin text without
+          // descenders — that excess is what made selection rectangles look
+          // 30–60 % too tall in the editor. The pixel-tight version brings
+          // it down to the real ink footprint.
+          const tight = tightenBBoxToGlyphs(page.canvas, rawBBox);
+          const bbox = tight ? { x0: tight.x0, y0: tight.y0, x1: tight.x1, y1: tight.y1 } : rawBBox;
+          const tightBaseY = tight ? tight.baseY : (it.baseY ?? rawBBox.y1);
+          const tightTop   = tight ? tight.glyphTop : rawBBox.y0;
           const bg = sampleBg(page.canvas, bbox);
           const fg = sampleFg(page.canvas, bbox, bg);
+          // Vertical text flag — tall, narrow cells with multiple glyphs.
+          const isVertical = detectVerticalText(page.canvas, bbox, it.text);
           const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(it.text);
           // Family chain: PDF-embedded font (pdfjs-registered) → matched web
           // font (with its own fallbacks) → Korean OS fallbacks → generic.
@@ -260,23 +273,35 @@ export default function TextEdit() {
               letterSpacing = delta;
             }
           }
+          // Use the tightened rect for layer geometry. Width is unchanged
+          // (PDF horizontal extent is reliable — comes from the text matrix),
+          // height/y collapse to the ink footprint.
+          const layerX = bbox.x0;
+          const layerY = tightTop;
+          const layerW = bbox.x1 - bbox.x0;
+          const layerH = Math.max(8, tightBaseY - tightTop);
+          // Re-derive ascent/descent against the tight box so drawTextOverlay's
+          // baseline = layerY + ascent lands exactly on the detected ink-bottom.
+          const tightAscent  = layerH * (it.fdAscent  != null ? Math.min(0.98, Math.max(0.6, it.fdAscent  / (it.fdAscent + (it.fdDescent ?? 0.2)))) : 0.92);
+          const tightDescent = layerH - tightAscent;
           return {
             id: crypto.randomUUID(),
             text: it.text,
             originalText: it.text,
-            x: it.x,
-            y: it.y,
-            w: it.w,
-            h: it.h,
-            originalX: it.x,
-            originalY: it.y,
-            originalW: it.w,
-            originalH: it.h,
-            baseY: it.baseY,
-            ascent: it.ascent,
-            descent: it.descent,
-            angleDeg: it.angleDeg || 0,
+            x: layerX,
+            y: layerY,
+            w: layerW,
+            h: layerH,
+            originalX: layerX,
+            originalY: layerY,
+            originalW: layerW,
+            originalH: layerH,
+            baseY: tightBaseY,
+            ascent: tightAscent,
+            descent: tightDescent,
+            angleDeg: it.angleDeg || (isVertical ? -90 : 0),
             skewXDeg: it.skewXDeg || 0,
+            isVertical,
             letterSpacing,
             lineHeight: it.fontSize, // single-line PDF item: line-height equals font-size
             pdfFamily: it.pdfFamily || '',
@@ -291,19 +316,33 @@ export default function TextEdit() {
             isItalic: !!it.skewXDeg || /italic|oblique/i.test(it.fontName),
             color: fg,
             bgColor: bg,
-            // Synthesise per-word bboxes inside the layer's tight rect so
-            // 단어 수정 mode can target a specific word within a multi-word
-            // sentence cell. Uniform char-width estimation — same approach
-            // as splitAtCellGaps, doesn't depend on font measurement.
-            words: synthWords(it.text, it.x, it.y, it.w, it.h),
+            // Per-word bboxes powered by measureText against the matched
+            // font — replaces the previous uniform char-width estimate so
+            // proportional fonts (Inter, Pretendard …) yield word boundaries
+            // that line up with the actual rendered glyphs. Click-to-word
+            // selection therefore hits the visible word every time, even
+            // mid-sentence.
+            words: synthWordsMeasured(it.text, layerX, layerY, layerW, layerH, {
+              fontFamily,
+              fontSize: it.fontSize,
+              fontWeight: m.weight,
+              letterSpacing,
+            }),
             visible: true,
             edited: false,
             source: 'pdf',
           };
         });
+      // Sentence-level merge — adjacent fragments on the same baseline with
+      // matching font/size/weight collapse into one editable run. pdfjs's
+      // tokeniser frequently splits a single visual sentence across multiple
+      // items (one per font, kerning gap, or operator boundary); the merge
+      // pass recovers natural reading units so the user edits whole phrases
+      // instead of single-word slivers.
+      const mergedLayers = mergeAdjacentLayers(layers);
       onProg?.({ progress: 0.95, stage: '레이어 적용 중' });
       await sleep(40);
-      setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers, ocrDone: true } : p)));
+      setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers: mergedLayers, ocrDone: true } : p)));
       onProg?.({ progress: 1, stage: '완료' });
       return;
     }
@@ -441,41 +480,52 @@ export default function TextEdit() {
       }
       // Anchor the layer to the WORD bboxes, not the line bbox. Tesseract's
       // line bbox can include empty space above the actual glyphs (rule
-      // padding, between-cell whitespace, multi-row noise) — using it as
-      // the layer rect leaves portions of the original glyph row outside
-      // the erase footprint, which is what showed up in the screenshot as
-      // a faint duplicate of the original text below the edited one.
-      // word.bbox hugs the actual ink, so:
-      //   - max(word.y1) is the true baseline (where glyphs sit)
-      //   - min(word.y0) is the true glyph top
-      // Both fall back to the line bbox when Tesseract didn't give a
-      // words array.
+      // padding, between-cell whitespace, multi-row noise).
       const wTops = (line.words || []).map((w) => w?.bbox?.y0).filter((y) => y > 0);
       const wBots = (line.words || []).map((w) => w?.bbox?.y1).filter((y) => y > 0);
-      const glyphTop = wTops.length ? Math.min(...wTops) : line.bbox.y0;
-      const baseY    = wBots.length ? Math.max(...wBots) : line.bbox.y1;
-      // Tight layer height = the actual glyph extent. ascent stored as the
-      // full height anchors the drawing baseline (l.y + ascent) to the
-      // detected baseline regardless of fontSize.
-      const tightH = Math.max(8, baseY - glyphTop);
+      const wLefts = (line.words || []).map((w) => w?.bbox?.x0).filter((x) => x > 0);
+      const wRights = (line.words || []).map((w) => w?.bbox?.x1).filter((x) => x > 0);
+      const wordTop    = wTops.length   ? Math.min(...wTops)   : line.bbox.y0;
+      const wordBot    = wBots.length   ? Math.max(...wBots)   : line.bbox.y1;
+      const wordLeft   = wLefts.length  ? Math.min(...wLefts)  : line.bbox.x0;
+      const wordRight  = wRights.length ? Math.max(...wRights) : line.bbox.x1;
+      // Pixel-tight refinement: scan ink inside the word-derived rect and
+      // crop further to the actual visible glyph extent. Tesseract's word
+      // bboxes already hug the ink fairly well, but they routinely include
+      // 1–3 px padding for the adaptive classifier; the pixel pass removes
+      // it so the selection rectangle the user sees lines up exactly with
+      // the glyph. The original ORIGINAL_* values are kept on the layer so
+      // the erase pass still covers the full pre-edit footprint.
+      const tight = tightenBBoxToGlyphs(page.canvas, {
+        x0: wordLeft, y0: wordTop, x1: wordRight, y1: wordBot,
+      });
+      const layerX = tight ? tight.x0 : wordLeft;
+      const layerY = tight ? tight.glyphTop : wordTop;
+      const layerW = (tight ? tight.x1 : wordRight) - layerX;
+      const baseY  = tight ? tight.baseY : wordBot;
+      const tightH = Math.max(8, baseY - layerY);
+      const isVertical = detectVerticalText(page.canvas, {
+        x0: layerX, y0: layerY, x1: layerX + layerW, y1: baseY,
+      }, text);
       layers.push({
         id: crypto.randomUUID(),
         text,
         originalText: text,
-        x: line.bbox.x0,
-        y: glyphTop,
-        w: lbw,
+        x: layerX,
+        y: layerY,
+        w: layerW,
         h: tightH,
-        originalX: line.bbox.x0,
-        originalY: glyphTop,
-        originalW: lbw,
+        originalX: layerX,
+        originalY: layerY,
+        originalW: layerW,
         originalH: tightH,
         baseY,
         // ascent = full height so baseY-of-draw lands exactly at the
         // detected glyph baseline. descent kept small (just AA buffer).
         ascent: tightH * 0.92,
         descent: tightH * 0.08,
-        angleDeg: 0,
+        angleDeg: isVertical ? -90 : 0,
+        isVertical,
         skewXDeg: g.isItalic ? 10 : 0,
         letterSpacing,
         lineHeight: g.size,
@@ -499,7 +549,8 @@ export default function TextEdit() {
         source: 'ocr',
       });
     }
-    setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers, ocrDone: true } : p)));
+    const mergedLayers = mergeAdjacentLayers(layers);
+    setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers: mergedLayers, ocrDone: true } : p)));
   };
 
   const runOcrCurrent = async () => {
@@ -621,7 +672,7 @@ export default function TextEdit() {
                   const newSize = +patch.fontSize || 14;
                   const newH = Math.max(8, Math.round(newSize * 1.0));
                   const newAscent = newH * 0.92;
-                  const fixedBase = (next.baseY ?? (l.y + l.ascent ?? l.h));
+                  const fixedBase = next.baseY ?? (l.y + (l.ascent ?? l.h));
                   next.h = newH;
                   next.ascent = newAscent;
                   next.descent = newH * 0.08;
@@ -972,6 +1023,90 @@ const PageThumb = memo(function PageThumb({ page, pageIdx, active }) {
   prev.active === next.active
 ));
 
+// Sentence-level merge pass over a layer list. Adjacent layers in the same
+// visual line are collapsed into one editable run when they share enough
+// typographical state to reasonably represent one phrase:
+//   - same fontFamily + fontWeight + fontSize (± 1 px)
+//   - similar baseY (± 25 % of fontSize)
+//   - same colour
+//   - horizontal gap ≤ 1.2 × fontSize  (≈ one-glyph spacer)
+//   - not flagged vertical
+// The merged layer:
+//   - inherits the typographical fields of the leftmost fragment,
+//   - joins the texts with a single space when not already adjacent,
+//   - extends the bbox to the union of the inputs,
+//   - rebuilds the per-word list across the joined text so word-level
+//     selection still pinpoints the original glyph the user clicked.
+function mergeAdjacentLayers(layers) {
+  if (!layers || layers.length < 2) return layers;
+  // Sort top-to-bottom, then left-to-right — we only attempt merges within
+  // a single horizontal band so this ordering is what we want.
+  const sorted = layers.slice().sort((a, b) => {
+    const dy = (a.baseY || a.y) - (b.baseY || b.y);
+    if (Math.abs(dy) > 2) return dy;
+    return a.x - b.x;
+  });
+  const out = [];
+  for (const cur of sorted) {
+    const last = out.length ? out[out.length - 1] : null;
+    if (last && canMerge(last, cur)) {
+      const gap = cur.x - (last.x + last.w);
+      const joiner = gap > Math.max(2, last.fontSize * 0.15) ? ' ' : '';
+      const text = `${last.text}${joiner}${cur.text}`;
+      const x0 = Math.min(last.x, cur.x);
+      const x1 = Math.max(last.x + last.w, cur.x + cur.w);
+      const y0 = Math.min(last.y, cur.y);
+      const y1 = Math.max(last.y + last.h, cur.y + cur.h);
+      const baseY = Math.max(last.baseY ?? last.y + last.h, cur.baseY ?? cur.y + cur.h);
+      // Rebuild words: take existing per-word bboxes, then shift by the
+      // joiner-induced offset. Since both inputs already had absolute canvas
+      // coordinates inside `.words`, we can just concat.
+      const words = [...(last.words || []), ...(cur.words || [])];
+      const merged = {
+        ...last,
+        text,
+        originalText: `${last.originalText || last.text}${joiner}${cur.originalText || cur.text}`,
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+        originalX: x0,
+        originalY: y0,
+        originalW: x1 - x0,
+        originalH: y1 - y0,
+        baseY,
+        ascent: (y1 - y0) * 0.92,
+        descent: (y1 - y0) * 0.08,
+        words,
+      };
+      out[out.length - 1] = merged;
+    } else {
+      out.push(cur);
+    }
+  }
+  return out;
+}
+function canMerge(a, b) {
+  if (a.isVertical || b.isVertical) return false;
+  if (a.angleDeg || b.angleDeg) return false;
+  if (a.fontFamily !== b.fontFamily) return false;
+  if (a.fontWeight !== b.fontWeight) return false;
+  if (Math.abs((a.fontSize || 0) - (b.fontSize || 0)) > 1) return false;
+  const baseA = a.baseY ?? a.y + a.h;
+  const baseB = b.baseY ?? b.y + b.h;
+  const fz = Math.max(a.fontSize || 0, b.fontSize || 0, 1);
+  if (Math.abs(baseA - baseB) > fz * 0.25) return false;
+  if ((a.color || '') !== (b.color || '')) return false;
+  // x-ordering: b must sit to the right of a, with a gap small enough to be
+  // an in-sentence spacer. 1.2 em is roughly one full-width Korean glyph or
+  // a wide Latin word-space — anything more and the two fragments belong to
+  // distinct sentences / cells.
+  const gap = b.x - (a.x + a.w);
+  if (gap < -2) return false;             // overlapping → don't touch
+  if (gap > fz * 1.2) return false;       // too far apart
+  return true;
+}
+
 let _layerMeasureCtx = null;
 // Measure the rendered glyph width of a layer using its actual font, size and
 // weight — same string the canvas will use when drawTextOverlay redraws.
@@ -1001,16 +1136,55 @@ function measureLayerWidth(l) {
   return Math.max(20, Math.ceil(measured + lsFallback + trailPad));
 }
 
-// Per-word bbox synthesis with uniform char-width. Powers 단어 수정 mode
-// for PDF-source layers (OCR layers get real per-word bboxes from
-// Tesseract's line.words array). Imperfect for proportional fonts but
-// always within a few px — accurate enough that the click-to-word
-// detection in TextLayersOverlay picks the right word every time.
-function synthWords(text, x, y, w, h) {
+// Per-word bbox synthesis using ctx.measureText against the layer's actual
+// font / size / weight. Replaces the previous uniform-char-width approach,
+// which treated every glyph as the same width — fine for Korean (mostly
+// fullwidth) but off by 20–40 % for proportional Latin fonts where "i" /
+// "m" / "W" differ in width. The measured version walks the string once,
+// summing advance widths, so word boundaries land exactly under the
+// rendered glyph in the editor.
+//
+// Falls back to uniform spacing when document / canvas is unavailable
+// (SSR-style environments) so the synthesis never throws.
+function synthWordsMeasured(text, x, y, w, h, style) {
+  if (!text) return [];
+  if (typeof document === 'undefined') return synthWordsUniform(text, x, y, w, h);
+  const ctx = (window._synthWordsCtx ||= document.createElement('canvas').getContext('2d'));
+  const size = Math.max(4, +style?.fontSize || 14);
+  const weight = +style?.fontWeight || 400;
+  const family = style?.fontFamily || 'sans-serif';
+  ctx.font = `${weight} ${size}px ${family}`;
+  if (style?.letterSpacing) {
+    try { ctx.letterSpacing = `${style.letterSpacing}px`; } catch {}
+  } else {
+    try { ctx.letterSpacing = '0px'; } catch {}
+  }
+  // Measured advance widths can drift from the original PDF advances by a
+  // few percent because the matched web font isn't byte-identical to the
+  // embedded face. Scale measured widths so the sum lines up with the
+  // detected layer width — keeps word boundaries inside the visible cell.
+  const naturalSum = ctx.measureText(text).width || 1;
+  const scale = w / naturalSum;
+  const parts = text.split(/(\s+)/);
+  const out = [];
+  let cursorX = x;
+  for (const part of parts) {
+    if (!part) continue;
+    const advance = ctx.measureText(part).width * scale;
+    if (!/^\s+$/.test(part)) {
+      out.push({
+        text: part,
+        bbox: { x0: cursorX, y0: y, x1: cursorX + advance, y1: y + h },
+      });
+    }
+    cursorX += advance;
+  }
+  return out;
+}
+function synthWordsUniform(text, x, y, w, h) {
   if (!text) return [];
   const charW = w / Math.max(1, text.length);
   const out = [];
-  // Split on whitespace runs, keep separators so cursor stays in sync.
   const parts = text.split(/(\s+)/);
   let cursor = 0;
   for (const part of parts) {
