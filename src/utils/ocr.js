@@ -49,8 +49,7 @@ export function suppressTableLines(srcCanvas, opts = {}) {
     const W = srcCanvas.width, H = srcCanvas.height;
     const img = sctx.getImageData(0, 0, W, H);
     const data = img.data;
-    // Per-row longest dark-pixel run length. Only horizontal lines are
-    // suppressed (see below).
+    // Per-row longest dark-pixel run length.
     const rowDarkRun = new Array(H).fill(0);
     for (let y = 0; y < H; y++) {
       let run = 0, maxRun = 0;
@@ -65,9 +64,10 @@ export function suppressTableLines(srcCanvas, opts = {}) {
     }
 
     octx.fillStyle = '#ffffff';
-    // Mask HORIZONTAL rules only. Vertical rules are intentionally preserved
-    // because Tesseract leans on them to keep adjacent cells separate — wipe
-    // them and "업체명 (주)와이유 대표자 유정태" fuses into a single OCR line.
+    // Mask HORIZONTAL rules first. Vertical rules are addressed below with a
+    // narrower predicate so we don't accidentally erase column rules that
+    // Tesseract relies on to keep adjacent cells separate — only short,
+    // isolated vertical strokes that pierce glyph rows get cleaned.
     for (let y = 0; y < H; y++) {
       if (rowDarkRun[y] < minLen) continue;
       let thickness = 1;
@@ -80,11 +80,156 @@ export function suppressTableLines(srcCanvas, opts = {}) {
         y += thickness;
       }
     }
+    // Per-column longest dark-pixel run length, recomputed from the original
+    // image. We only suppress a column-line segment if it's SHORT (well below
+    // page height) — i.e. an in-cell border that crosses one glyph row. Full
+    // table column rules (≥ 40 % of page height) are preserved as Tesseract
+    // line/cell separators.
+    const minColLen = opts.minColLen ?? Math.max(20, Math.round(H * 0.04));
+    const maxColLen = opts.maxColLen ?? Math.round(H * 0.30);
+    for (let x = 0; x < W; x++) {
+      let run = 0;
+      let runStart = 0;
+      for (let y = 0; y <= H; y++) {
+        const isDark = y < H && (() => {
+          const i = (y * W + x) * 4;
+          const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          return lum < darkThr;
+        })();
+        if (isDark) {
+          if (run === 0) runStart = y;
+          run++;
+        } else if (run > 0) {
+          // Commit the previous run if it's a thin in-cell vertical (length
+          // between minColLen and maxColLen). Anything taller is treated as
+          // a column rule and left alone.
+          if (run >= minColLen && run <= maxColLen) {
+            // Verify thickness ≤ maxThickness by checking neighbouring cols.
+            let thickness = 1;
+            for (let dx = 1; dx <= maxThickness + 1 && x + dx < W; dx++) {
+              // Sample the midpoint of the run in the neighbour column.
+              const my = runStart + (run >> 1);
+              const ni = (my * W + (x + dx)) * 4;
+              const lum = 0.299 * data[ni] + 0.587 * data[ni + 1] + 0.114 * data[ni + 2];
+              if (lum < darkThr) thickness++;
+              else break;
+            }
+            if (thickness <= maxThickness) {
+              octx.fillRect(Math.max(0, x - 1), runStart, thickness + 2, run);
+            }
+          }
+          run = 0;
+        }
+      }
+    }
     return out;
   } catch {
     return srcCanvas;
   }
 }
+
+// Tighten a bbox to the actual glyph ink. OCR (and PDF text items) report
+// bounding boxes that often include 10–30 % vertical padding above and below
+// the visible glyph — line spacing, descender slack, Tesseract's adaptive
+// box, etc. We scan pixels inside the bbox, find the local background
+// luminance from the corners, and crop the rect to the min/max x/y where
+// dark pixels live.
+//
+// Returns { x0, y0, x1, y1, baseY } in canvas pixels. baseY is the bottom of
+// the ink (true baseline approximation when descenders are absent — e.g. for
+// Korean text and most Latin text without g/p/q/y). The original bbox is
+// returned unchanged when:
+//   - the bbox is degenerate (< 4 px in either dim),
+//   - no ink is found (transparent / empty cell),
+//   - or the background sample is itself dark (likely a dark-on-light
+//     reverse layout where corner sampling fails — keep original to be safe).
+export function tightenBBoxToGlyphs(canvas, bbox, opts = {}) {
+  const pad = opts.pad ?? 1;
+  const minRetain = opts.minRetain ?? 0.4; // refuse to shrink below 40 % h
+  try {
+    const w = bbox.x1 - bbox.x0;
+    const h = bbox.y1 - bbox.y0;
+    if (w < 4 || h < 4) return null;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.getImageData(bbox.x0, bbox.y0, w, h);
+    const data = img.data;
+    // Sample background from the four corner 2×2 patches (median luminance).
+    const cornerLums = [];
+    const samplePatch = (cx, cy) => {
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          const x = Math.max(0, Math.min(w - 1, cx + dx));
+          const y = Math.max(0, Math.min(h - 1, cy + dy));
+          const i = (y * w + x) * 4;
+          cornerLums.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+        }
+      }
+    };
+    samplePatch(0, 0);
+    samplePatch(w - 2, 0);
+    samplePatch(0, h - 2);
+    samplePatch(w - 2, h - 2);
+    cornerLums.sort((a, b) => a - b);
+    const bgLum = cornerLums[Math.floor(cornerLums.length / 2)];
+    // Dark-pixel test relative to the local background. The 40-unit margin
+    // (luminance scale 0–255) sits well above JPEG/PNG noise but still
+    // catches faint anti-aliased glyph edges.
+    const margin = 40;
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0; y < h; y++) {
+      const rowStart = y * w * 4;
+      for (let x = 0; x < w; x++) {
+        const i = rowStart + x * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (Math.abs(lum - bgLum) > margin) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null; // empty
+    // Sanity: refuse to shrink height below `minRetain` × original — protects
+    // against degenerate scans of low-contrast glyphs where we'd otherwise
+    // collapse the box to just the darkest few pixels.
+    const tightH = maxY - minY + 1;
+    if (tightH < h * minRetain) return null;
+    return {
+      x0: Math.max(0, bbox.x0 + minX - pad),
+      y0: Math.max(0, bbox.y0 + minY - pad),
+      x1: Math.min(canvas.width, bbox.x0 + maxX + 1 + pad),
+      y1: Math.min(canvas.height, bbox.y0 + maxY + 1 + pad),
+      baseY: bbox.y0 + maxY + 1,    // ink-bottom — best baseline proxy w/o descenders
+      glyphTop: bbox.y0 + minY,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Decide whether a bbox holds VERTICALLY-stacked text. Heuristic:
+//   - aspect = w / h < 0.6 (taller than wide)
+//   - text contains ≥ 2 characters (single glyphs aren't "vertical" on their own)
+//   - mean inter-row ink gap < 30 % of the bbox width (rows are roughly square
+//     stacked glyphs, not a single tall character like a logo)
+// Returns `true` when the cell should be flagged as 90°-rotated. We deliberately
+// don't try to RE-rotate the underlying OCR result here — Tesseract already gives
+// us per-glyph data; the rotation flag lets the editor render the synthesised
+// edit-layer with `angleDeg: -90` so typing matches the original orientation.
+export function detectVerticalText(canvas, bbox, text) {
+  try {
+    const w = bbox.x1 - bbox.x0;
+    const h = bbox.y1 - bbox.y0;
+    if (w < 4 || h < 12) return false;
+    if (w / h >= 0.6) return false;
+    if (!text || text.replace(/\s+/g, '').length < 2) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 
 // Canonical font set — also used to populate dropdowns and font preloads.
 // Generic-family fallbacks are appended so glyph widths stay close to the
