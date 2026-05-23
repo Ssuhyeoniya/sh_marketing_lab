@@ -655,13 +655,15 @@ export default function TextEdit() {
   };
 
   useEffect(() => {
+    // Schedule a redraw on any state change that affects the canvas. We do
+    // NOT cancel any pending rAF in cleanup — `latestCurrentRef.current` is
+    // re-bound on every render so a rAF queued during a previous render
+    // will still read the LATEST state when it fires. Cancelling on every
+    // effect re-run was a bug: when several state updates landed in a quick
+    // succession during upload (setPages → fontsTick → dispScale → …) the
+    // cleanup kept cancelling the rAF before it could ever fire, and the
+    // canvas stayed empty even though the page object was sitting in state.
     scheduleRedraw();
-    return () => {
-      if (redrawRafRef.current) {
-        cancelAnimationFrame(redrawRafRef.current);
-        redrawRafRef.current = 0;
-      }
-    };
   }, [current, currentIdx, pages, fontsTick]);
 
   const update = (id, patch) => {
@@ -1465,19 +1467,35 @@ function drawTextOverlay(ctx, l) {
   const newTop = baseY - ascent;
   const newBottom = baseY + descent;
   const PAD = 1;
-  const bg = l.bgColor || '#ffffff';
-  ctx.fillStyle = bg;
+  // Background is TRANSPARENT by default. Two cases need a fill:
+  //   1) ALWAYS erase the original-glyph footprint with the locally-sampled
+  //      page colour so the original ink doesn't show through behind the
+  //      edited / moved text. This uses `l.bgColor` (sampled at OCR time)
+  //      and is required regardless of user preference.
+  //   2) ONLY if the user explicitly chose a background colour for this
+  //      layer (`l.bgColorEdited`) do we paint a coloured rect behind the
+  //      new text position. Otherwise the new text overlays whatever's
+  //      already on the canvas — matching the user's request that
+  //      "글씨 배경은 무조건 기본값 투명".
+  const eraseBg = l.bgColor || '#ffffff';
   const ox = l.originalX ?? l.x, oy = l.originalY ?? l.y;
   const ow = l.originalW ?? l.w, oh = l.originalH ?? l.h;
+  ctx.fillStyle = eraseBg;
   ctx.fillRect(ox - PAD, oy - PAD, ow + PAD * 2, oh + PAD * 2);
-  const newLeft = l.x - PAD;
-  const newRight = l.x + Math.max(l.w, Math.ceil(newW)) + PAD;
-  const newTopP = Math.min(l.y, newTop) - PAD;
-  const newBottomP = Math.max(l.y + l.h, newBottom) + PAD;
-  if (newLeft < ox - PAD || newRight > ox + ow + PAD || newTopP < oy - PAD || newBottomP > oy + oh + PAD) {
-    ctx.fillRect(newLeft, newTopP, newRight - newLeft, newBottomP - newTopP);
+  if (l.bgColorEdited && l.bgColor) {
+    const newLeft = l.x - PAD;
+    const newRight = l.x + Math.max(l.w, Math.ceil(newW)) + PAD;
+    const newTopP = Math.min(l.y, newTop) - PAD;
+    const newBottomP = Math.max(l.y + l.h, newBottom) + PAD;
+    if (newLeft < ox - PAD || newRight > ox + ow + PAD || newTopP < oy - PAD || newBottomP > oy + oh + PAD) {
+      ctx.fillStyle = l.bgColor;
+      ctx.fillRect(newLeft, newTopP, newRight - newLeft, newBottomP - newTopP);
+    }
   }
-  const fg = l.colorEdited ? (l.color || '#111111') : ensureContrast(l.color || '#111111', bg);
+  // Foreground: when contrast is dynamic, sample against the sampled page
+  // background — that's what's actually behind the glyph after the erase
+  // pass, not the (now-transparent) user bg.
+  const fg = l.colorEdited ? (l.color || '#111111') : ensureContrast(l.color || '#111111', eraseBg);
   ctx.fillStyle = fg;
   // Apply transform: rotation around baseline-origin + synthetic italic skew.
   // Order matters — rotate first (per the PDF's text matrix), then skew so
