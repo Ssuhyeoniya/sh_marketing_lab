@@ -105,9 +105,15 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
     }
   }, [isEditing]);
 
-  // Display fontSize in CSS px — match OCR-detected size exactly, no clamping,
+  // Display fontSize in CSS px — match OCR/PDF-detected size exactly,
   // so the inline editor renders text at the same scale as the canvas output.
   const displayFontSize = (+l.fontSize || 14) * scale;
+  // CSS line baseline sits ~80% from top of the line box at line-height = 1.
+  // Move the input so its glyph baseline aligns with the layer's exact baseY.
+  // ascent ratio of the source glyphs within the bbox:
+  const ascentRatio = l.h > 0 ? (l.ascent ?? l.h * 0.82) / l.h : 0.82;
+  // Vertical offset to compensate for CSS's default baseline placement (~0.8).
+  const baselineNudge = (ascentRatio - 0.8) * h;
 
   // Border styles by state — all clearly visible.
   let border, bg;
@@ -166,11 +172,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
             style={{
               position: 'absolute',
               left: 0,
-              top: 0,
-              // Allow the input to overflow when the displayed font size is
-              // larger than the original OCR bbox (e.g., the user typed more
-              // characters). This keeps the visible glyphs WYSIWYG with the
-              // canvas output instead of clipping or auto-scaling.
+              top: baselineNudge,
               width: 'auto',
               minWidth: '100%',
               height: '100%',
@@ -183,10 +185,13 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
               lineHeight: `${h}px`,
               fontFamily: l.fontFamily,
               fontWeight: l.fontWeight,
+              letterSpacing: 0,
               padding: 0,
               margin: 0,
               boxSizing: 'border-box',
               textAlign: 'left',
+              transform: l.angleDeg ? `rotate(${l.angleDeg}deg)` : undefined,
+              transformOrigin: '0 100%',
             }}
           />
         )}
