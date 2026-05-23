@@ -326,7 +326,7 @@ button { font-family: inherit; }
   font-size: 12px; font-weight: 600; color: var(--text);
   min-width: 180px; white-space: nowrap;
 }
-.progress-bar-overlay .bar { flex: 1; }
+.progress-bar-overlay .bar { flex: 1; margin: 0; }
 .progress-bar-overlay .pct {
   font-size: 11px; color: var(--text-muted);
   min-width: 38px; text-align: right; font-variant-numeric: tabular-nums;

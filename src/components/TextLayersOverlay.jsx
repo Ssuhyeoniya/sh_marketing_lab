@@ -24,6 +24,9 @@ export default function TextLayersOverlay({
   onDeleteLayer,
   onAreaErase,
   onAreaEraseDelete,
+  // Called once at the start of an atomic mutation (drag, edit, ...) so the
+  // parent can snapshot the pre-mutation state into its undo history.
+  onMutateStart,
 }) {
   const [drag, setDrag] = useState(null);
   const [editingId, setEditingId] = useState(null);
@@ -37,12 +40,17 @@ export default function TextLayersOverlay({
   useEffect(() => {
     if (!drag) return;
     let moved = false;
+    let snapshotted = false;
     const onMove = (e) => {
       const dx = (e.clientX - drag.sx) / scale;
       const dy = (e.clientY - drag.sy) / scale;
       if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
       if (!moved) return;
-      onUpdate(drag.id, { x: Math.round(drag.ox + dx), y: Math.round(drag.oy + dy), edited: true });
+      if (!snapshotted) { onMutateStart?.(); snapshotted = true; }
+      // Position-only patch — do NOT mark `edited`. The redraw will lift the
+      // original glyph bitmap from the source canvas instead of rasterising
+      // the text with a web font, so the typography metric is preserved 1:1.
+      onUpdate(drag.id, { x: Math.round(drag.ox + dx), y: Math.round(drag.oy + dy), moved: true });
     };
     const onUp = () => setDrag(null);
     window.addEventListener('mousemove', onMove);
@@ -51,7 +59,7 @@ export default function TextLayersOverlay({
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [drag, scale, onUpdate]);
+  }, [drag, scale, onUpdate, onMutateStart]);
 
   // Area-erase drag handler.
   useEffect(() => {
@@ -182,6 +190,7 @@ export default function TextLayersOverlay({
                 while (s > 0 && isWordCh(text[s - 1])) s--;
                 while (end < text.length && isWordCh(text[end])) end++;
                 const sel = s === end ? [0, text.length] : [s, end];
+                onMutateStart?.();
                 setEditingCaret(sel);
                 setEditingId(l.id);
                 return;
@@ -196,6 +205,7 @@ export default function TextLayersOverlay({
               e.preventDefault();
               setDrag(null);
               onSelect?.(l.id);
+              onMutateStart?.();
               setEditingCaret(null); // null → select all
               setEditingId(l.id);
             }}
