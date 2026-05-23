@@ -52,38 +52,80 @@ export default function TextLayersOverlay({
   const layersRef = useRef(layers);
   layersRef.current = layers;
 
+  // Stable refs for the parent-supplied callbacks. The callbacks are recreated
+  // on every TextEdit render (they're not memoised), so depending on them in
+  // the drag effect would re-run the effect on every layer patch — and a
+  // mid-drag re-run resets the effect's local `notifiedActive`/`moved`/
+  // `snapshotted` flags, which caused mouseup-after-rerender to skip the
+  // "drag ended" notification and leave the parent's `dragActiveRef` stuck
+  // at true. The next user drag would then never trigger a canvas redraw,
+  // which is what the "두 번째 이동이 안 된다" bug was — second move worked
+  // in state but the canvas redraw was suppressed.
+  const onUpdateRef = useRef(onUpdate);
+  onUpdateRef.current = onUpdate;
+  const onMutateStartRef = useRef(onMutateStart);
+  onMutateStartRef.current = onMutateStart;
+  const onDragActiveChangeRef = useRef(onDragActiveChange);
+  onDragActiveChangeRef.current = onDragActiveChange;
+  const onAreaEraseRef = useRef(onAreaErase);
+  onAreaEraseRef.current = onAreaErase;
+  // Drag-internal flags must survive effect re-runs too. They reset when the
+  // drag state itself transitions to null (drag ended).
+  const dragNotifiedRef = useRef(false);
+  const dragMovedRef = useRef(false);
+  const dragSnapshottedRef = useRef(false);
+
   // Exit edit mode when switching modes.
   useEffect(() => { setEditingId(null); setDrag(null); setAreaDrag(null); }, [editMode]);
 
-  // Layer drag handler (sentence mode).
+  // Drag lifecycle — fires ONCE on drag end, regardless of how many times
+  // the listener effect below re-ran during the drag.
+  useEffect(() => {
+    if (!drag) {
+      if (dragNotifiedRef.current) {
+        dragNotifiedRef.current = false;
+        dragMovedRef.current = false;
+        dragSnapshottedRef.current = false;
+        onDragActiveChangeRef.current?.(false);
+      }
+    }
+  }, [drag]);
+
+  // Layer drag listener (sentence mode). Depends ONLY on `drag` and `scale`
+  // now — the parent callbacks are accessed through refs so identity churn
+  // doesn't re-trigger the effect mid-drag.
   useEffect(() => {
     if (!drag) return;
-    let moved = false;
-    let snapshotted = false;
-    let notifiedActive = false;
     const onMove = (e) => {
       const dx = (e.clientX - drag.sx) / scale;
       const dy = (e.clientY - drag.sy) / scale;
-      if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
-      if (!moved) return;
-      if (!snapshotted) { onMutateStart?.(); snapshotted = true; }
-      if (!notifiedActive) { onDragActiveChange?.(true); notifiedActive = true; }
+      if (Math.abs(dx) + Math.abs(dy) > 2) dragMovedRef.current = true;
+      if (!dragMovedRef.current) return;
+      if (!dragSnapshottedRef.current) {
+        onMutateStartRef.current?.();
+        dragSnapshottedRef.current = true;
+      }
+      if (!dragNotifiedRef.current) {
+        dragNotifiedRef.current = true;
+        onDragActiveChangeRef.current?.(true);
+      }
       // Position-only patch — do NOT mark `edited`. The redraw will lift the
       // original glyph bitmap from the source canvas instead of rasterising
       // the text with a web font, so the typography metric is preserved 1:1.
-      onUpdate(drag.id, { x: Math.round(drag.ox + dx), y: Math.round(drag.oy + dy), moved: true });
+      onUpdateRef.current?.(drag.id, {
+        x: Math.round(drag.ox + dx),
+        y: Math.round(drag.oy + dy),
+        moved: true,
+      });
     };
-    const onUp = () => {
-      setDrag(null);
-      if (notifiedActive) onDragActiveChange?.(false);
-    };
+    const onUp = () => setDrag(null);
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [drag, scale, onUpdate, onMutateStart, onDragActiveChange]);
+  }, [drag, scale]);
 
   // Area-erase drag handler.
   useEffect(() => {
@@ -389,7 +431,10 @@ function LayerBoxRaw({ layer: l, offsetX, offsetY, scale, isSelected, isEditing,
               whiteSpace: 'nowrap',
               border: 'none',
               outline: 'none',
-              background: l.bgColor || '#ffffff',
+              // Transparent by default — only paint a solid background
+              // when the user has explicitly chosen one (matches the
+              // canvas-side rule in drawTextOverlay).
+              background: l.bgColorEdited && l.bgColor ? l.bgColor : 'transparent',
               color: l.color || '#111111',
               fontSize: displayFontSize,
               lineHeight: `${lineH}px`,
