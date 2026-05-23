@@ -9,6 +9,7 @@ import { useFontsReady } from '../../utils/fonts';
 import { SYSTEM_FONTS } from '../../utils/ocr';
 import TextLayersOverlay from '../../components/TextLayersOverlay';
 import PropertiesToolbar from '../../components/PropertiesToolbar';
+import ConfirmDialog from '../../components/ConfirmDialog';
 
 const FONT_OPTIONS = SYSTEM_FONTS;
 
@@ -27,6 +28,9 @@ export default function TextEdit() {
   const [selectedLayerId, setSelectedLayerId] = useState(null);
   const [dispScale, setDispScale] = useState(1);
   const [editMode, setEditMode] = useState('sentence');
+  // Confirm dialog used by both delete modes — guards against accidental
+  // wipes. Enter = Yes, Esc = No (wired inside the dialog component).
+  const [confirmState, setConfirmState] = useState(null);
   const wrapRef = useRef(null);
 
   // Memoised selected-layer reference. The downstream PropertiesToolbar is
@@ -106,6 +110,8 @@ export default function TextEdit() {
   // Global keyboard shortcuts: Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y.
   useEffect(() => {
     const onKey = (e) => {
+      // Confirm dialog owns Enter/Esc keys while open — don't run undo/redo.
+      if (confirmState) return;
       const target = e.target;
       // Don't hijack typing inside the inline text editor.
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
@@ -117,7 +123,7 @@ export default function TextEdit() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [pages]);
+  }, [pages, confirmState]);
 
   // Track canvas display size for overlay coord conversion.
   useEffect(() => {
@@ -289,8 +295,11 @@ export default function TextEdit() {
     // Fallback: rasterized OCR for scans / image-only PDFs / images.
     onProg?.({ stage: 'Tesseract OCR 인식 중' });
     const data = await recognizeImage(page.canvas, onProg);
-    // Lines keep multi-syllable Korean intact; fall back to words if lines missing.
-    const items = (data.lines || []).length ? data.lines : (data.words || []);
+    // Prefer word-level boxes — line-level frames make per-word editing
+    // impossible (clicking one English word forces you to retype the whole
+    // line). When Tesseract returns no words (e.g. dense Korean blocks
+    // without spaces) we fall back to lines.
+    const items = (data.words || []).length ? data.words : (data.lines || []);
     const layers = items
       .filter((line) => {
         const text = (line.text || '').trim();
@@ -458,23 +467,42 @@ export default function TextEdit() {
     );
   };
 
-  // ezPDF: 텍스트 삭제 — mark the layer's original glyphs as covered.
-  // Keeps the layer so the user can undo by toggling visibility.
-  const softDeleteLayer = (id) => {
+  // The raw mutations — kept private to TextEdit, always invoked through the
+  // confirmation wrappers below so a stray click can't silently wipe data.
+  const _doSoftDelete = (id) => {
     pushHistory();
     setPages((ps) => ps.map((p, i) => i !== currentIdx ? p : {
       ...p,
       layers: p.layers.map((l) => l.id === id ? { ...l, deleted: true, edited: false } : l),
     }));
   };
-
-  // ezPDF: 영역 삭제 — push an axis-aligned erase rect onto the page.
-  const addEraseRegion = (rect) => {
+  const _doAddErase = (rect) => {
     pushHistory();
     setPages((ps) => ps.map((p, i) => i !== currentIdx ? p : {
       ...p,
       eraseRegions: [...(p.eraseRegions || []), { ...rect, color: '#ffffff' }],
     }));
+  };
+
+  // ezPDF: 텍스트 삭제 — opens a confirm dialog before covering the glyphs.
+  const softDeleteLayer = (id) => {
+    const layer = current?.layers.find((l) => l.id === id);
+    const preview = (layer?.text || '').slice(0, 80);
+    setConfirmState({
+      message: '선택한 텍스트를 삭제하시겠습니까?',
+      detail: preview ? `"${preview}${(layer?.text || '').length > 80 ? '…' : ''}"` : null,
+      onYes: () => { setConfirmState(null); _doSoftDelete(id); },
+      onNo: () => setConfirmState(null),
+    });
+  };
+  // ezPDF: 영역 삭제 — opens a confirm dialog before painting the erase rect.
+  const addEraseRegion = (rect) => {
+    setConfirmState({
+      message: '선택한 영역을 삭제하시겠습니까?',
+      detail: `${Math.round(rect.w)} × ${Math.round(rect.h)} 픽셀 영역의 내용이 흰색으로 덮입니다.`,
+      onYes: () => { setConfirmState(null); _doAddErase(rect); },
+      onNo: () => setConfirmState(null),
+    });
   };
   const removeEraseRegion = (idx) => {
     pushHistory();
@@ -701,6 +729,14 @@ export default function TextEdit() {
         )}
       </div>
 
+      {confirmState && (
+        <ConfirmDialog
+          message={confirmState.message}
+          detail={confirmState.detail}
+          onYes={confirmState.onYes}
+          onNo={confirmState.onNo}
+        />
+      )}
     </div>
   );
 }

@@ -243,7 +243,11 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
       if (caretRange && caretRange.length === 2) {
         try { inputRef.current.setSelectionRange(caretRange[0], caretRange[1]); } catch {}
       } else {
-        inputRef.current.select();
+        // Place the cursor at the END of the text — never auto-select-all.
+        // Selecting all on focus meant any accidental keystroke wiped the
+        // original line, which felt like "the text suddenly changed".
+        const len = inputRef.current.value.length;
+        try { inputRef.current.setSelectionRange(len, len); } catch {}
       }
     }
   }, [isEditing, caretRange]);
