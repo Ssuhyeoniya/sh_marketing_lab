@@ -295,65 +295,83 @@ export default function TextEdit() {
     // Fallback: rasterized OCR for scans / image-only PDFs / images.
     onProg?.({ stage: 'Tesseract OCR 인식 중' });
     const data = await recognizeImage(page.canvas, onProg);
-    // Prefer word-level boxes — line-level frames make per-word editing
-    // impossible (clicking one English word forces you to retype the whole
-    // line). When Tesseract returns no words (e.g. dense Korean blocks
-    // without spaces) we fall back to lines.
-    const items = (data.words || []).length ? data.words : (data.lines || []);
-    const layers = items
-      .filter((line) => {
-        const text = (line.text || '').trim();
-        if (!text) return false;
-        if ((line.confidence ?? 100) < 30) return false;
-        if (!/[a-zA-Z0-9가-힣]/.test(text)) return false;
-        const bw = line.bbox.x1 - line.bbox.x0;
-        const bh = line.bbox.y1 - line.bbox.y0;
-        if (bw < 6 || bh < 6) return false;
-        return true;
-      })
-      .map((line) => {
-        const g = guessFont(line, page.canvas);
-        const bw = line.bbox.x1 - line.bbox.x0;
-        const bh = line.bbox.y1 - line.bbox.y0;
-        const bg = sampleBg(page.canvas, line.bbox);
-        const fg = sampleFg(page.canvas, line.bbox, bg);
-        const text = line.text.trim();
-        const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(text);
-        const fontFamily = buildFontFamilyChain({
-          pdfFamily: '',
-          matchedFontFamily: g.font.family,
-          isKorean,
-          kind: g.font.kind || 'sans',
-        });
-        // Letter-spacing reconstruction from OCR bbox width — measure with
-        // the SAME weight we'll render with, so bold-vs-regular advance
-        // differences are absorbed by Tc instead of squishing glyphs.
+
+    // Hybrid line + word strategy:
+    //   - Detect font metrics (size, weight, color, …) on the LINE because
+    //     line bboxes encompass full ascender→descender extent and give a
+    //     stable height. Word bboxes only hug the actual glyph extent, so
+    //     "ace" comes out short and "Tag" tall — that was the source of the
+    //     "font size broken per-word" regression.
+    //   - Emit a LAYER per word, using its own bbox for position/width but
+    //     inheriting font properties from its parent line so all words on a
+    //     line share the same typography. If a line has no word array
+    //     (dense Korean), fall back to one layer for the whole line.
+    const lines = data.lines || [];
+    const layers = [];
+    for (const line of lines) {
+      const lineText = (line.text || '').trim();
+      if (!lineText) continue;
+      if ((line.confidence ?? 100) < 30) continue;
+      if (!/[a-zA-Z0-9가-힣]/.test(lineText)) continue;
+      const lbw = line.bbox.x1 - line.bbox.x0;
+      const lbh = line.bbox.y1 - line.bbox.y0;
+      if (lbw < 6 || lbh < 6) continue;
+
+      // Line-level font metric — computed ONCE, shared by every word.
+      const g = guessFont(line, page.canvas);
+      const lineBg = sampleBg(page.canvas, line.bbox);
+      const lineFg = sampleFg(page.canvas, line.bbox, lineBg);
+      const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(lineText);
+      const fontFamily = buildFontFamilyChain({
+        pdfFamily: '',
+        matchedFontFamily: g.font.family,
+        isKorean,
+        kind: g.font.kind || 'sans',
+      });
+
+      // Words within the line. Tesseract puts them on `line.words`; when
+      // it's missing we synthesise a single word covering the full line.
+      const words = (line.words && line.words.length) ? line.words : [{
+        text: lineText, bbox: line.bbox, confidence: line.confidence,
+      }];
+
+      for (const word of words) {
+        const wt = (word.text || '').trim();
+        if (!wt) continue;
+        const wbw = word.bbox.x1 - word.bbox.x0;
+        const wbh = word.bbox.y1 - word.bbox.y0;
+        if (wbw < 3 || wbh < 3) continue;
+
+        // Letter-spacing per-word using its own bbox + the line's font.
         let letterSpacing = 0;
-        if (text.length > 1 && typeof document !== 'undefined') {
+        if (wt.length > 1 && typeof document !== 'undefined') {
           const mctx = document.createElement('canvas').getContext('2d');
           mctx.font = `${g.weight} ${g.size}px ${fontFamily}`;
-          const native = mctx.measureText(text).width;
-          const delta = (bw - native) / (text.length - 1);
+          const native = mctx.measureText(wt).width;
+          const delta = (wbw - native) / (wt.length - 1);
           if (isFinite(delta) && Math.abs(delta) < g.size * 0.4) letterSpacing = delta;
         }
-        return {
+
+        layers.push({
           id: crypto.randomUUID(),
-          text,
-          originalText: text,
-          x: line.bbox.x0,
+          text: wt,
+          originalText: wt,
+          // Bbox: word for position/width; LINE-derived for height so the
+          // frame matches the visual line, not just the glyph extent of
+          // this particular word. Keeps ascender/descender aligned across
+          // a line and prevents per-word size jitter.
+          x: word.bbox.x0,
           y: line.bbox.y0,
-          w: bw,
-          h: bh,
-          originalX: line.bbox.x0,
+          w: wbw,
+          h: lbh,
+          originalX: word.bbox.x0,
           originalY: line.bbox.y0,
-          originalW: bw,
-          originalH: bh,
+          originalW: wbw,
+          originalH: lbh,
           baseY: line.bbox.y1,
-          ascent: bh * 0.82,
-          descent: bh * 0.18,
+          ascent: lbh * 0.82,
+          descent: lbh * 0.18,
           angleDeg: 0,
-          // Synthetic italic via OCR-detected oblique; ~10° matches most
-          // typical italic faces (Helvetica Oblique, Pretendard Italic, etc.).
           skewXDeg: g.isItalic ? 10 : 0,
           letterSpacing,
           lineHeight: g.size,
@@ -362,17 +380,16 @@ export default function TextEdit() {
           fontName: g.font.name,
           fontSize: g.size,
           fontWeight: g.weight,
-          // Track raw OCR-detected style flags so the right-panel can show
-          // a B / I badge and the user can toggle them explicitly.
           isBold: !!g.isBold,
           isItalic: !!g.isItalic,
-          color: fg,
-          bgColor: bg,
+          color: lineFg,
+          bgColor: lineBg,
           visible: true,
           edited: false,
           source: 'ocr',
-        };
-      });
+        });
+      }
+    }
     setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers, ocrDone: true } : p)));
   };
 
