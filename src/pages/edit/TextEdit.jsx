@@ -312,16 +312,23 @@ export default function TextEdit() {
     // boundary inside the line and pre-selects it in the input. This avoids
     // over-fragmenting the document into one-frame-per-word.
     const rawLines = data.lines || [];
-    // Tesseract groups everything on the same baseline into one "line", which
-    // for tables means a whole row (multiple cells separated by the vertical
-    // rule) collapses into ONE line with massive whitespace gaps. Re-split
-    // each Tesseract line by clustering its words on x-gap: anywhere the gap
-    // between consecutive words is bigger than ~4× the line's typical word
-    // gap (or > 1.5× line height) is treated as a cell boundary.
+    // Two-pass cell splitting:
+    //   (1) splitOcrLineByRows  — Tesseract with PSM 6 merges vertically
+    //       adjacent text in the same column into ONE line (a multi-line cell
+    //       like "미디엄 다크 로스팅 커피로 다크초콜릿을 / 한입 베어먹은 듯한 /
+    //       프리미엄 원두" becomes one line with bbox-height of 3 rows). Split
+    //       on Y-gap between successive words.
+    //   (2) splitOcrLineByCells — re-splits the result on X-gap so a single
+    //       table row (multiple cells with the column rule suppressed) breaks
+    //       into per-cell pseudo-lines.
+    // After both passes each output represents one visual table cell.
     const lines = [];
     for (const rawLine of rawLines) {
-      const cellsInLine = splitOcrLineByCells(rawLine);
-      for (const cl of cellsInLine) lines.push(cl);
+      for (const rowLine of splitOcrLineByRows(rawLine)) {
+        for (const cell of splitOcrLineByCells(rowLine)) {
+          lines.push(cell);
+        }
+      }
     }
     const layers = [];
     for (const line of lines) {
@@ -336,7 +343,7 @@ export default function TextEdit() {
       // garbage you saw at the top of the page (stylised logo glyphs OCR'd
       // into "A 저 서" / "CFFEE 놀부"). 55 still keeps decent body text and
       // drops the unrecoverable junk.
-      if ((line.confidence ?? 100) < 55) continue;
+      if ((line.confidence ?? 100) < 60) continue;
       // Must contain real text content — same hasTextContent rule used on the
       // PDF path.
       if (!/[a-zA-Z0-9가-힣]/.test(text)) continue;
@@ -352,8 +359,31 @@ export default function TextEdit() {
       // horizontal rule that survived suppression and got OCR'd into one
       // stretched character. Drop them.
       if (lbw / lbh > 25 && meaningful < 4) continue;
+      // Image-as-text filter: a single-word cell with very few
+      // alphanumeric chars is almost always Tesseract grasping at logo
+      // edges / icon noise. Real cells with one short word are like
+      // "봉", "2" — those have meaningful >= 1 but ALSO live inside a
+      // wider table cell, so we additionally require the cell to be
+      // narrower than ~5× the line height (icons are usually square,
+      // i.e. aspect ≈ 1).
+      const wordCount = (line.words || []).length;
+      if (wordCount <= 1 && meaningful < 2 && lbw / lbh < 5) continue;
 
       const g = guessFont(line, page.canvas);
+      // Override the heuristic fontSize with the MEDIAN word-height-based
+      // size when words are available. The line bbox can be much taller
+      // than the actual glyphs (multi-line cells, paragraph leading), so
+      // height × 0.88 over-estimates. Median word height tracks the real
+      // visible glyph extent.
+      const wHeights = (line.words || [])
+        .map((w) => (w.bbox?.y1 ?? 0) - (w.bbox?.y0 ?? 0))
+        .filter((h) => h > 4)
+        .sort((a, b) => a - b);
+      if (wHeights.length) {
+        const medianH = wHeights[Math.floor(wHeights.length / 2)];
+        const isK = /[가-힣]/.test(text);
+        g.size = Math.round(medianH * (isK ? 0.88 : 0.78));
+      }
       const bg = sampleBg(page.canvas, line.bbox);
       const fg = sampleFg(page.canvas, line.bbox, bg);
       const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(text);
@@ -808,6 +838,54 @@ function synthWords(text, x, y, w, h) {
     cursor += part.length;
   }
   return out;
+}
+
+// Re-split a Tesseract line into per-VISUAL-ROW pseudo-lines. PSM 6
+// sometimes bundles vertically stacked text in the same column (a multi-
+// line table cell) into ONE OCR line — that's how a 3-line product
+// description ended up with a bbox 3× the actual line height, and why
+// guessFont reported fontSize 100+ for what was really 30 px text.
+// Cluster words by their TOP y-coordinate: anything that jumps by more
+// than ~0.7 × median word height starts a new row.
+function splitOcrLineByRows(line) {
+  const words = ((line.words) || []).filter((w) => w && w.bbox && w.text && w.text.trim());
+  if (words.length <= 1) return [line];
+
+  const sorted = [...words].sort((a, b) => a.bbox.y0 - b.bbox.y0);
+  const heights = sorted.map((w) => w.bbox.y1 - w.bbox.y0).filter((h) => h > 0).sort((a, b) => a - b);
+  const medianH = heights.length ? heights[Math.floor(heights.length / 2)] : 1;
+  const threshold = medianH * 0.7;
+
+  const rows = [[sorted[0]]];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = rows[rows.length - 1];
+    const avgPrevTop = prev.reduce((s, w) => s + w.bbox.y0, 0) / prev.length;
+    if (sorted[i].bbox.y0 - avgPrevTop > threshold) {
+      rows.push([sorted[i]]);
+    } else {
+      prev.push(sorted[i]);
+    }
+  }
+  if (rows.length === 1) return [line];
+
+  return rows.map((rowWords) => {
+    rowWords.sort((a, b) => a.bbox.x0 - b.bbox.x0);
+    const x0 = Math.min(...rowWords.map((w) => w.bbox.x0));
+    const y0 = Math.min(...rowWords.map((w) => w.bbox.y0));
+    const x1 = Math.max(...rowWords.map((w) => w.bbox.x1));
+    const y1 = Math.max(...rowWords.map((w) => w.bbox.y1));
+    return {
+      text: rowWords.map((w) => w.text).join(' '),
+      bbox: { x0, y0, x1, y1 },
+      confidence: line.confidence,
+      words: rowWords,
+      font_size: line.font_size,
+      is_bold: line.is_bold,
+      is_italic: line.is_italic,
+      is_serif: line.is_serif,
+      is_monospace: line.is_monospace,
+    };
+  });
 }
 
 // Re-split a Tesseract line into per-cell pseudo-lines. Tesseract groups
