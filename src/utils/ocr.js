@@ -31,6 +31,164 @@ export async function recognizeImage(src, onProgress) {
   return data;
 }
 
+// Image preprocessing for OCR. Returns a NEW canvas with:
+//   - 2× upscaling if the source DPI looks small (heuristic: width < 1800),
+//     using a multi-step (bicubic-equivalent) draw so glyph edges stay
+//     reasonably clean. Tesseract is tuned for ~300 DPI document scans;
+//     low-DPI inputs produce mushy edges and break Korean glyph
+//     recognition first.
+//   - Mild luminance sharpen: pulls anti-aliased glyph edges back toward
+//     pure-dark so the adaptive classifier doesn't dither into the
+//     background. Implemented via a 3×3 unsharp mask applied only to dark
+//     pixels (so coloured backgrounds and graphics aren't crunched).
+//   - Soft denoise on near-background pixels: anything within 12 luminance
+//     units of the local row median snaps to white. Removes JPEG ringing
+//     around small Korean glyphs without erasing real strokes.
+// Bypasses entirely (returns the source canvas as-is) when:
+//   - canvas is already very large (≥ 2400 px wide),
+//   - or any single dimension is so large that allocating the 2× target
+//     would blow past a sensible 30 megapixel ceiling.
+export function preprocessForOcr(srcCanvas, opts = {}) {
+  const upscaleThreshold = opts.upscaleThreshold ?? 1800;
+  const maxPixels = opts.maxPixels ?? 30 * 1024 * 1024; // ~30 MP target cap
+  try {
+    const srcW = srcCanvas.width, srcH = srcCanvas.height;
+    let scale = srcW < upscaleThreshold ? 2 : 1;
+    if (srcW * srcH * scale * scale > maxPixels) scale = 1;
+    const tgtW = srcW * scale, tgtH = srcH * scale;
+
+    // Upscale to an intermediate canvas. `imageSmoothingQuality = "high"`
+    // is bicubic-like in Chromium/Safari/Firefox, which is what we want
+    // for text — bilinear leaves diagonal strokes serrated.
+    const big = document.createElement('canvas');
+    big.width = tgtW;
+    big.height = tgtH;
+    const bctx = big.getContext('2d');
+    if (scale > 1) {
+      bctx.imageSmoothingEnabled = true;
+      bctx.imageSmoothingQuality = 'high';
+    }
+    bctx.drawImage(srcCanvas, 0, 0, tgtW, tgtH);
+
+    // Sharpen + denoise in one pass over the pixel buffer. We avoid a full
+    // convolution kernel (slow on a 2× upscaled page) by doing per-pixel
+    // contrast stretching against a row-local background estimate.
+    const img = bctx.getImageData(0, 0, tgtW, tgtH);
+    const data = img.data;
+    // Row-local bg estimate: mean luminance of every 16th pixel per row.
+    // Cheap O(W*H/16). Robust enough for documents — pages with mixed
+    // light/dark regions still get a usable per-row baseline.
+    const stride = 16;
+    for (let y = 0; y < tgtH; y++) {
+      let sum = 0, cnt = 0;
+      const rowOff = y * tgtW * 4;
+      for (let x = 0; x < tgtW; x += stride) {
+        const i = rowOff + x * 4;
+        sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        cnt++;
+      }
+      const rowBg = cnt ? sum / cnt : 240;
+      // Snap-to-white margin: how close to bg a pixel must be to be
+      // considered noise. 12/255 ≈ 5 % luminance — well below the
+      // contrast of real anti-aliased glyph edges.
+      const denoiseMargin = 12;
+      // Sharpen factor: pull dark pixels darker, bright pixels brighter.
+      // Applied softly (0.4) so coloured text / graphics aren't crushed.
+      const sharpen = 0.4;
+      for (let x = 0; x < tgtW; x++) {
+        const i = rowOff + x * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (Math.abs(lum - rowBg) < denoiseMargin) {
+          // Near-background noise → snap to white-ish (use rowBg so
+          // coloured backgrounds stay their colour).
+          data[i]   = Math.min(255, Math.round(rowBg));
+          data[i+1] = Math.min(255, Math.round(rowBg));
+          data[i+2] = Math.min(255, Math.round(rowBg));
+        } else if (lum < rowBg) {
+          // Dark pixel — sharpen toward black.
+          data[i]   = Math.max(0, data[i]   - Math.round(sharpen * (rowBg - lum)));
+          data[i+1] = Math.max(0, data[i+1] - Math.round(sharpen * (rowBg - lum)));
+          data[i+2] = Math.max(0, data[i+2] - Math.round(sharpen * (rowBg - lum)));
+        }
+      }
+    }
+    bctx.putImageData(img, 0, 0);
+    return big;
+  } catch {
+    return srcCanvas;
+  }
+}
+
+// Garbage-text detector for PDF text-layer extraction.
+//
+// pdfjs's `getTextContent()` returns the Unicode string for each text
+// item — but only if the PDF's font carries a usable ToUnicode CMap. CJK
+// PDFs commonly subset their fonts and map glyphs to Private Use Area
+// (PUA) codepoints with no real Unicode mapping; pdfjs then falls back
+// to glyph names that decode as random Latin sequences, producing
+// strings like "ATE 2개월 peuED 됩니다" where parts of the Korean text
+// got mangled into mid-word case-mixed Latin clusters.
+//
+// We can't detect this from the codepoints alone (PUA chars look the
+// same as legit Korean), but the Latin tokens that come out are almost
+// always shaped unlike real English words:
+//   - mid-word case mix ("peuED", "AbcDEF") — real words don't do this,
+//   - lowercase→uppercase transition inside one token — same reason.
+// In a string that's MOSTLY Korean (so the document language is Korean),
+// any Latin token that doesn't look like a sane English word or acronym
+// is therefore very suspicious.
+//
+// Returns true when the string looks corrupted. False = trust it.
+export function looksGarbledKorean(s) {
+  if (!s) return false;
+  const text = String(s);
+  const hangulMatches = text.match(/[가-힣]/g);
+  if (!hangulMatches || hangulMatches.length === 0) return false;
+  // Tokenise on whitespace and any non-Latin/non-digit separator. We
+  // examine Latin-only tokens for impossible capitalisation patterns.
+  const tokens = text.split(/[\s,.()[\]{}<>"'/\\:;!?·•|\-_]+/);
+  for (const t of tokens) {
+    if (!t || t.length < 2) continue;
+    if (!/^[A-Za-z]+$/.test(t)) continue;       // contains digits / unicode → skip
+    const isAllLower   = /^[a-z]+$/.test(t);
+    const isAllUpper   = /^[A-Z]+$/.test(t);
+    const isCamelCase  = /^[a-z]+(?:[A-Z][a-z]+)+$/.test(t);   // camelCase
+    const isPascalCase = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/.test(t); // PascalCase / Title Case
+    if (isAllLower || isAllUpper || isCamelCase || isPascalCase) continue;
+    // Anything else with a Latin-only body in a Korean text is suspect:
+    //   "peuED"  → lower then UPPER mid-word (PUA → glyph-name fallback)
+    //   "AtE"    → random capitalisation
+    //   "aBC"    → starts lower then all-caps
+    return true;
+  }
+  return false;
+}
+
+// Aggregate quality assessment for a page's worth of pdfjs text items.
+// Returns:
+//   { trusted: boolean, garbledCount, total, ratio }
+// `trusted = false` when ≥ 15 % of items look garbled — at that point
+// the page's whole text layer is unreliable and the caller should fall
+// back to running OCR on the rasterised page bitmap.
+export function assessPdfTextQuality(items) {
+  const list = Array.isArray(items) ? items : [];
+  let garbled = 0;
+  let total = 0;
+  for (const it of list) {
+    const t = (it?.text ?? it?.str ?? '').trim();
+    if (!t) continue;
+    total++;
+    if (looksGarbledKorean(t)) garbled++;
+  }
+  const ratio = total ? garbled / total : 0;
+  return {
+    trusted: ratio < 0.15,
+    garbledCount: garbled,
+    total,
+    ratio,
+  };
+}
+
 // Detect long, thin runs of dark pixels (table borders) and paint over them
 // with the local background colour so OCR isn't disrupted by ruled lines
 // crossing or hugging glyphs. Returns a NEW canvas — original untouched so
