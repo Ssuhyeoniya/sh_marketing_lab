@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
-import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText, preprocessForOcr, assessPdfTextQuality } from '../../utils/ocr';
+import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText, preprocessForOcr, assessPdfTextQuality, looksGarbledKorean } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob, extractPageTextItems } from '../../utils/pdf';
 import { PDFDocument } from 'pdf-lib';
 import { useFontsReady } from '../../utils/fonts';
@@ -237,7 +237,16 @@ export default function TextEdit() {
           const t = (it.text || '').trim();
           if (!t) return false;
           if (it.w < 2 || it.h < 4) return false;
-          return /[a-zA-Z0-9가-힣]|[^ -]/.test(t);
+          if (!/[a-zA-Z0-9가-힣]|[^ -]/.test(t)) return false;
+          // Per-item garble drop: even on pages whose overall garble ratio
+          // sits below the page-level OCR-fallback threshold, individual
+          // items can still be corrupt (mid-word capitalised Latin in a
+          // Korean string, particle-free Hangul runs, lone-letter mix).
+          // We drop those items entirely instead of letting them appear as
+          // editable layers with nonsense text. The visible glyph stays on
+          // the page bitmap; the user just can't edit it from this layer.
+          if (looksGarbledKorean(t)) return false;
+          return true;
         })
         .map((it) => {
           const style = page.pdfText.styles?.[it.fontName];
@@ -343,6 +352,12 @@ export default function TextEdit() {
             originalW: layerW,
             originalH: layerH,
             baseY: baselineY,
+            // Pixel-tight glyph extent — stored separately from the line-box
+            // so the erase pass can wipe EXACTLY the rendered ink without
+            // bleeding into the line-spacing above / below (which can hold
+            // adjacent table-row text).
+            glyphTop: tightTop,
+            glyphBottom: tightBaseY,
             ascent: layerAscent,
             descent: layerDescent,
             angleDeg: it.angleDeg || (isVertical ? -90 : 0),
@@ -379,13 +394,14 @@ export default function TextEdit() {
             source: 'pdf',
           };
         });
-      // Sentence-level merge — adjacent fragments on the same baseline with
-      // matching font/size/weight collapse into one editable run. pdfjs's
-      // tokeniser frequently splits a single visual sentence across multiple
-      // items (one per font, kerning gap, or operator boundary); the merge
-      // pass recovers natural reading units so the user edits whole phrases
-      // instead of single-word slivers.
-      const mergedLayers = mergeAdjacentLayers(layers);
+      // Dedup overlapping-bbox duplicates FIRST — Korean PDFs frequently
+      // emit a visible glyph item AND an invisible ActualText item at the
+      // same position; both came out as editable layers and the user
+      // ended up editing one while the other still rendered on top.
+      // Then run sentence-merge on the survivors so fragments split by
+      // pdfjs's tokeniser (one per font, kerning gap, operator boundary)
+      // collapse into one editable phrase.
+      const mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
       onProg?.({ progress: 0.95, stage: '레이어 적용 중' });
       await sleep(40);
       setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers: mergedLayers, ocrDone: true } : p)));
@@ -601,6 +617,9 @@ export default function TextEdit() {
         originalW: layerW,
         originalH: layerH,
         baseY,
+        // Pixel-tight glyph extent for the erase pass — see PDF path comment.
+        glyphTop: tight ? tight.glyphTop : wordTop,
+        glyphBottom: baseY,
         ascent: layerAscent,
         descent: layerDescent,
         angleDeg: isVertical ? -90 : 0,
@@ -628,7 +647,10 @@ export default function TextEdit() {
         source: 'ocr',
       });
     }
-    const mergedLayers = mergeAdjacentLayers(layers);
+    // Dedup duplicate / overlapping layers FIRST (PDFs that emit visible
+    // glyphs + invisible ActualText overlay create two layers per visual
+    // text), then run the sentence-merge pass on the survivors.
+    const mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
     setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers: mergedLayers, ocrDone: true } : p)));
   };
 
@@ -1118,6 +1140,53 @@ const PageThumb = memo(function PageThumb({ page, pageIdx, active }) {
 //   - extends the bbox to the union of the inputs,
 //   - rebuilds the per-word list across the joined text so word-level
 //     selection still pinpoints the original glyph the user clicked.
+// Drop overlapping-bbox duplicate layers. Some PDFs emit the same visual
+// text TWICE in their content stream:
+//   - once as visible glyphs with a custom CMap (the layer the eye sees),
+//   - once as an invisible accessibility / "ActualText" overlay carrying
+//     the real Unicode at zero ink opacity.
+// pdfjs returns BOTH as text items at near-identical bboxes, so both
+// turn into editable layers — and the user ends up editing one while
+// the other still shows up in the next render.
+//
+// Heuristic: when two layers' bboxes overlap by ≥ 60 % of the smaller
+// rect's area, treat them as duplicates. Keep the one with the cleaner
+// text (not garble-flagged); on a tie, keep the longer string.
+function dedupOverlappingLayers(layers) {
+  if (!layers || layers.length < 2) return layers;
+  const drop = new Set();
+  for (let i = 0; i < layers.length; i++) {
+    if (drop.has(i)) continue;
+    const a = layers[i];
+    for (let j = i + 1; j < layers.length; j++) {
+      if (drop.has(j)) continue;
+      const b = layers[j];
+      const ax2 = a.x + a.w, ay2 = a.y + a.h;
+      const bx2 = b.x + b.w, by2 = b.y + b.h;
+      const ix0 = Math.max(a.x, b.x), iy0 = Math.max(a.y, b.y);
+      const ix1 = Math.min(ax2, bx2), iy1 = Math.min(ay2, by2);
+      if (ix1 <= ix0 || iy1 <= iy0) continue;
+      const inter = (ix1 - ix0) * (iy1 - iy0);
+      const aArea = Math.max(1, a.w * a.h);
+      const bArea = Math.max(1, b.w * b.h);
+      const overlap = inter / Math.min(aArea, bArea);
+      if (overlap < 0.6) continue;
+      // Pick the survivor.
+      // Lazy load looksGarbledKorean from the closure scope — already imported.
+      const aGarbled = typeof looksGarbledKorean === 'function' && looksGarbledKorean(a.text);
+      const bGarbled = typeof looksGarbledKorean === 'function' && looksGarbledKorean(b.text);
+      let dropIdx;
+      if (aGarbled && !bGarbled) dropIdx = i;
+      else if (bGarbled && !aGarbled) dropIdx = j;
+      else if ((a.text || '').length >= (b.text || '').length) dropIdx = j;
+      else dropIdx = i;
+      drop.add(dropIdx);
+      if (dropIdx === i) break;     // 'a' is gone, restart with next i
+    }
+  }
+  return layers.filter((_, i) => !drop.has(i));
+}
+
 function mergeAdjacentLayers(layers) {
   if (!layers || layers.length < 2) return layers;
   // Sort top-to-bottom, then left-to-right — we only attempt merges within
@@ -1299,7 +1368,14 @@ function splitOcrLineByRows(line) {
   const sorted = [...words].sort((a, b) => a.bbox.y0 - b.bbox.y0);
   const heights = sorted.map((w) => w.bbox.y1 - w.bbox.y0).filter((h) => h > 0).sort((a, b) => a - b);
   const medianH = heights.length ? heights[Math.floor(heights.length / 2)] : 1;
-  const threshold = medianH * 0.7;
+  // Aggressive row split — 0.55 × median word height. Korean text rows
+  // commonly sit within 1.2 line-heights of each other, so the previous
+  // 0.7 missed adjacent-row pairs whose vertical gap was just under
+  // 70 % of the glyph height. With 0.55 we still ignore the natural
+  // baseline jitter inside a single OCR line (Korean glyphs vary by
+  // 1–2 px due to the round-up in the adaptive classifier) while
+  // catching real row breaks earlier.
+  const threshold = medianH * 0.55;
 
   const rows = [[sorted[0]]];
   for (let i = 1; i < sorted.length; i++) {
@@ -1405,30 +1481,39 @@ function renderEdits(ctx, p) {
   for (const l of p.layers) {
     const needsErase = l.deleted || l.edited || (l.moved && !l.deleted);
     if (!needsErase) continue;
-    // Pad the erase rect by 15 % of the font height (min 3 px). The previous
-    // 1 px was too tight for large headlines — antialiased glyph pixels
-    // bleeding ~2 px past the OCR bbox were left behind, which is what
-    // looked like ghost text under a moved layer.
+    // Erase rect uses the PIXEL-TIGHT glyph extent (glyphTop / glyphBottom
+    // captured at OCR time) instead of the line-box. The line-box is
+    // anchored to fontSize so the editor input fits, but it can overhang
+    // adjacent rows in tightly-stacked tables — using the line-box for
+    // the erase pass made the wipe bleed into the next row. The tight
+    // rect covers exactly what was rendered.
     const fz = +l.fontSize || 14;
-    const PAD = Math.max(3, Math.round(fz * 0.15));
+    const PAD_X = Math.max(3, Math.round(fz * 0.18)); // side-bearing slack
+    const PAD_Y = Math.max(2, Math.round(fz * 0.10)); // AA halo slack
+    const ox = (l.originalX ?? l.x);
+    const ow = (l.originalW ?? l.w);
+    const top = (l.glyphTop != null ? l.glyphTop : (l.originalY ?? l.y));
+    const bot = (l.glyphBottom != null ? l.glyphBottom : ((l.originalY ?? l.y) + (l.originalH ?? l.h)));
     ctx.fillStyle = l.bgColor || '#ffffff';
-    ctx.fillRect(
-      (l.originalX ?? l.x) - PAD,
-      (l.originalY ?? l.y) - PAD,
-      (l.originalW ?? l.w) + PAD * 2,
-      (l.originalH ?? l.h) + PAD * 2,
-    );
+    ctx.fillRect(ox - PAD_X, top - PAD_Y, ow + PAD_X * 2, (bot - top) + PAD_Y * 2);
   }
   for (const l of p.layers) {
     if (l.deleted || l.edited || l.visible === false) continue;
     if (!l.moved) continue;
     // Lift the original glyph pixels and place them at the new position.
-    // Same source/dest dimensions = no scaling = no metric drift.
+    // Same source/dest dimensions = no scaling = no metric drift. Source
+    // rect uses the PIXEL-TIGHT extent so the lifted bitmap contains the
+    // glyph and nothing else (no partial neighbour cell content).
     const sx = l.originalX ?? l.x;
-    const sy = l.originalY ?? l.y;
     const sw = l.originalW ?? l.w;
-    const sh = l.originalH ?? l.h;
-    ctx.drawImage(src, sx, sy, sw, sh, l.x, l.y, sw, sh);
+    const sy = (l.glyphTop != null ? l.glyphTop : (l.originalY ?? l.y));
+    const sBot = (l.glyphBottom != null ? l.glyphBottom : ((l.originalY ?? l.y) + (l.originalH ?? l.h)));
+    const sh = Math.max(1, sBot - sy);
+    // Translate destination Y so the glyph baseline lifts to the new
+    // line-box's baseline (l.y is the line-box top after move). Aligns
+    // the moved glyph with the rest of the layer's geometry.
+    const dy = (l.y + ((sy - (l.originalY ?? l.y)) || 0));
+    ctx.drawImage(src, sx, sy, sw, sh, l.x, dy, sw, sh);
   }
   for (const l of p.layers) {
     if (l.deleted || !l.edited || l.visible === false) continue;

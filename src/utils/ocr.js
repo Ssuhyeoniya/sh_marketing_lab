@@ -130,13 +130,13 @@ export function preprocessForOcr(srcCanvas, opts = {}) {
 // got mangled into mid-word case-mixed Latin clusters.
 //
 // We can't detect this from the codepoints alone (PUA chars look the
-// same as legit Korean), but the Latin tokens that come out are almost
-// always shaped unlike real English words:
-//   - mid-word case mix ("peuED", "AbcDEF") — real words don't do this,
-//   - lowercase→uppercase transition inside one token — same reason.
-// In a string that's MOSTLY Korean (so the document language is Korean),
-// any Latin token that doesn't look like a sane English word or acronym
-// is therefore very suspicious.
+// same as legit Korean), but the output patterns are distinctive:
+//   1) Latin tokens with impossible capitalisation in a Korean context
+//      ("peuED", "AbcDEF") — real words / acronyms never look like this.
+//   2) Long Hangul runs with no spaces and no common grammatical
+//      particles ("c덕타커리젓짚전첫돌") — real Korean prose breaks every
+//      few characters with a particle (은/는/이/가/을/를/의/에/도/와/과/에서/
+//      으로/로/까지/부터/만/처럼/보다) or whitespace.
 //
 // Returns true when the string looks corrupted. False = trust it.
 export function looksGarbledKorean(s) {
@@ -144,22 +144,39 @@ export function looksGarbledKorean(s) {
   const text = String(s);
   const hangulMatches = text.match(/[가-힣]/g);
   if (!hangulMatches || hangulMatches.length === 0) return false;
-  // Tokenise on whitespace and any non-Latin/non-digit separator. We
-  // examine Latin-only tokens for impossible capitalisation patterns.
+  // 1) Latin-token capitalisation check (catches pdfjs glyph-name fallbacks).
   const tokens = text.split(/[\s,.()[\]{}<>"'/\\:;!?·•|\-_]+/);
   for (const t of tokens) {
     if (!t || t.length < 2) continue;
-    if (!/^[A-Za-z]+$/.test(t)) continue;       // contains digits / unicode → skip
+    if (!/^[A-Za-z]+$/.test(t)) continue;
     const isAllLower   = /^[a-z]+$/.test(t);
     const isAllUpper   = /^[A-Z]+$/.test(t);
-    const isCamelCase  = /^[a-z]+(?:[A-Z][a-z]+)+$/.test(t);   // camelCase
-    const isPascalCase = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/.test(t); // PascalCase / Title Case
+    const isCamelCase  = /^[a-z]+(?:[A-Z][a-z]+)+$/.test(t);
+    const isPascalCase = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/.test(t);
     if (isAllLower || isAllUpper || isCamelCase || isPascalCase) continue;
-    // Anything else with a Latin-only body in a Korean text is suspect:
-    //   "peuED"  → lower then UPPER mid-word (PUA → glyph-name fallback)
-    //   "AtE"    → random capitalisation
-    //   "aBC"    → starts lower then all-caps
     return true;
+  }
+  // 2) Long-Hangul-run-without-grammar check (catches PUA Hangul where
+  //    pdfjs returned valid-looking but random Hangul codepoints).
+  //    A run of ≥ 6 hangul chars with NO whitespace AND NO common particle
+  //    is almost certainly garbage — real prose / labels at that length
+  //    always contain at least one particle.
+  const particleRe = /[은는이가을를의에도와과로으]|에서|으로|까지|부터|처럼|보다|에게|에서|에는/;
+  const hangulRuns = text.match(/[가-힣]{6,}/g) || [];
+  for (const run of hangulRuns) {
+    if (!particleRe.test(run)) return true;
+  }
+  // 3) Hangul + Latin lone-letter mix without spacing
+  //    ("c덕타커리젓짚전첫돌" — lone "c" stuck to a Hangul run).
+  if (/[A-Za-z][가-힣]|[가-힣][A-Za-z]/.test(text)) {
+    // Allow ONLY when the Latin segment is a recognisable acronym /
+    // version-like token at a token boundary. The above regex fired on a
+    // direct alpha↔hangul transition with no whitespace, which is a strong
+    // garble signal — even "PDF편집" would trigger, so we additionally
+    // require the Hangul side to be ≥ 3 chars (to skip short labels like
+    // "PDF용") AND the Latin side to be lowercase mid-string (uppercase
+    // acronyms touching Hangul are fine: "AI기반").
+    if (/[a-z][가-힣]{3,}|[가-힣]{3,}[a-z]/.test(text)) return true;
   }
   return false;
 }
@@ -182,7 +199,10 @@ export function assessPdfTextQuality(items) {
   }
   const ratio = total ? garbled / total : 0;
   return {
-    trusted: ratio < 0.15,
+    // Aggressively bail on suspect PDFs: even 8 % garbled items means a
+    // meaningful chunk of the page is unreadable in the editor. OCR
+    // fallback is cheap relative to showing nonsense in the editable layer.
+    trusted: ratio < 0.08,
     garbledCount: garbled,
     total,
     ratio,
