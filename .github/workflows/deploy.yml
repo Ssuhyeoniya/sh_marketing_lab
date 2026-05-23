@@ -5,7 +5,7 @@ on:
     branches:
       - main
       - master
-      - claude/file-conversion-image-overlay-f54uU
+      - 'claude/**'
   workflow_dispatch:
 
 permissions:
