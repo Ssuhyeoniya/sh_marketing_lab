@@ -232,6 +232,46 @@ export default function TextEdit() {
       try { if (document.fonts && document.fonts.ready) await document.fonts.ready; } catch {}
       onProg?.({ progress: 0.5, stage: '폰트/좌표 매핑 중' });
       await sleep(60);
+
+      // ── Issue #26 A · page-context garble analysis ───────────────────────
+      // `looksGarbledKorean` only flags items containing BOTH Korean and
+      // suspicious Latin. PDFs frequently emit a corrupted Korean run as
+      // MULTIPLE separate items (e.g. one item "ATE", another "2개월 단위",
+      // another "EES", another "됩니다.") — the Latin-only fragments have
+      // no Hangul context and slip through. Pre-scan the whole page:
+      //   • garbledFonts : fontNames that produced ≥1 confirmed-garbled item
+      //   • isKoreanPage : page-level Hangul ratio > 20 % (lets us treat
+      //                    short-uppercase-Latin items as suspect — they're
+      //                    almost certainly PUA glyph-name fallbacks for
+      //                    CJK glyphs the subset CMap couldn't decode).
+      const _allItems = page.pdfText.items;
+      const _garbledFonts = new Set();
+      let _hangulCharCount = 0, _totalCharCount = 0;
+      for (const it of _allItems) {
+        const t = (it.text || '').trim();
+        if (!t) continue;
+        _totalCharCount += t.length;
+        _hangulCharCount += (t.match(/[가-힣]/g) || []).length;
+        if (looksGarbledKorean(t) && it.fontName) _garbledFonts.add(it.fontName);
+      }
+      const _isKoreanPage = _totalCharCount > 0 && (_hangulCharCount / _totalCharCount) > 0.2;
+      const _ALLOWED_STANDALONE = new Set([
+        'AI', 'AR', 'VR', 'IT', 'OS', 'PC', 'TV', 'PD', 'CD', 'DVD', 'USB',
+        'HD', 'FHD', 'UHD', '4K', '8K', 'OK', 'PDF', 'JPG', 'PNG', 'GIF',
+        'CEO', 'CTO', 'CFO', 'API', 'SDK', 'SUV', 'GPS', 'LED', 'LCD',
+        'OLED', 'IOS', 'IOT', 'SSD', 'HDD', 'CPU', 'GPU', 'RAM', 'ROM',
+        'MP3', 'MP4', 'KBS', 'MBC', 'SBS', 'YTN', 'JTBC', 'NASA', 'NATO',
+        'IMF', 'UN', 'WHO', 'CCTV', 'KTX', 'SRT', 'BTS', 'SK', 'LG', 'KT',
+        'GS', 'CJ', 'SM', 'YG', 'JYP', 'BMW', 'KIA', 'EV', 'VAT', 'NO',
+      ]);
+      const _isStandaloneGarble = (t) => {
+        const s = t.replace(/[\s.,()*·•\-_:]+/g, '');
+        if (!s) return false;
+        if (!/^[A-Z]{2,4}$/.test(s)) return false;
+        if (_ALLOWED_STANDALONE.has(s)) return false;
+        return true;
+      };
+
       const layers = page.pdfText.items
         .filter((it) => {
           const t = (it.text || '').trim();
@@ -246,6 +286,25 @@ export default function TextEdit() {
           // editable layers with nonsense text. The visible glyph stays on
           // the page bitmap; the user just can't edit it from this layer.
           if (looksGarbledKorean(t)) return false;
+          // Page-context garble drop (Issue #26 A). On a predominantly-
+          // Korean page:
+          //   (a) any item using a fontName that produced a confirmed-
+          //       garbled item is suspect — the corrupt CMap affects every
+          //       glyph in that subset, so Latin-only fragments emitted
+          //       through the same font are almost certainly PUA-CJK
+          //       fallbacks. We drop them; clean Korean runs through the
+          //       same font are kept (mixed-fontName pages can have one
+          //       intact and one broken subset).
+          //   (b) a standalone short uppercase Latin token ("ATE", "EES")
+          //       that isn't a recognised acronym is dropped outright.
+          if (_isKoreanPage) {
+            if (it.fontName && _garbledFonts.has(it.fontName)) {
+              const hasHangul = /[가-힣]/.test(t);
+              const hasSuspectLatin = /[A-Z]{2,}/.test(t);
+              if (!hasHangul || hasSuspectLatin) return false;
+            }
+            if (_isStandaloneGarble(t)) return false;
+          }
           return true;
         })
         .map((it) => {
