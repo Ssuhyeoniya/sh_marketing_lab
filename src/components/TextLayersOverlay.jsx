@@ -271,6 +271,12 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
   const displayFontSize = (+l.fontSize || 14) * scale;
   const lineH = displayFontSize;
   const baselineNudge = Math.max(0, (h - lineH) / 2);
+  // Visual padding — expands the CLICKABLE frame outside the tight glyph
+  // bbox so tight table cells are easier to grab. Layer data (x/y/w/h)
+  // stays tight, so drawTextOverlay's baseline math and canvas-text
+  // alignment are unaffected. The inner input is pushed back by the same
+  // amount to keep its glyphs perfectly stacked over the canvas glyphs.
+  const PAD = 3;
 
   let border, bg;
   if (isEditing) {
@@ -307,10 +313,10 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
         title={isEditing ? '' : titleForMode(editMode, l.text)}
         style={{
           position: 'absolute',
-          left: x,
-          top: y,
-          width: w,
-          height: h,
+          left: x - PAD,
+          top: y - PAD,
+          width: w + PAD * 2,
+          height: h + PAD * 2,
           border,
           background: bg,
           cursor,
@@ -336,8 +342,10 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
             onDoubleClick={(e) => e.stopPropagation()}
             style={{
               position: 'absolute',
-              left: 0,
-              top: baselineNudge,
+              // Compensate for the box's visual padding so the input glyphs
+              // sit exactly above the canvas glyphs underneath.
+              left: PAD,
+              top: PAD + baselineNudge,
               width: 'auto',
               minWidth: '100%',
               height: `${lineH}px`,
@@ -368,18 +376,18 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
       </div>
       {!isEditing && !isSelected && editMode !== 'delete-text' && (
         <>
-          <CornerTick left={x} top={y} color={l.edited ? '#3b82f6' : '#06b6d4'} />
-          <CornerTick left={x + w} top={y} color={l.edited ? '#3b82f6' : '#06b6d4'} />
-          <CornerTick left={x} top={y + h} color={l.edited ? '#3b82f6' : '#06b6d4'} />
-          <CornerTick left={x + w} top={y + h} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x - PAD} top={y - PAD} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x + w + PAD} top={y - PAD} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x - PAD} top={y + h + PAD} color={l.edited ? '#3b82f6' : '#06b6d4'} />
+          <CornerTick left={x + w + PAD} top={y + h + PAD} color={l.edited ? '#3b82f6' : '#06b6d4'} />
         </>
       )}
       {(isSelected || hover) && !isEditing && (
         <div
           style={{
             position: 'absolute',
-            left: x,
-            top: Math.max(0, y - 22),
+            left: x - PAD,
+            top: Math.max(0, y - PAD - 22),
             background: editMode === 'delete-text' ? '#ef4444' : (isSelected ? '#3b82f6' : '#06b6d4'),
             color: '#fff',
             fontSize: 10,

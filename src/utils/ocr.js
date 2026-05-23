@@ -49,11 +49,9 @@ export function suppressTableLines(srcCanvas, opts = {}) {
     const W = srcCanvas.width, H = srcCanvas.height;
     const img = sctx.getImageData(0, 0, W, H);
     const data = img.data;
-    // Per-row luminance summary
-    const rowDarkRun = new Array(H).fill(0); // longest dark run on each row
-    const colDarkRun = new Array(W).fill(0); // longest dark run on each col
-
-    // Horizontal pass
+    // Per-row longest dark-pixel run length. Only horizontal lines are
+    // suppressed (see below).
+    const rowDarkRun = new Array(H).fill(0);
     for (let y = 0; y < H; y++) {
       let run = 0, maxRun = 0;
       const rowStart = y * W * 4;
@@ -65,22 +63,11 @@ export function suppressTableLines(srcCanvas, opts = {}) {
       }
       rowDarkRun[y] = maxRun;
     }
-    // Vertical pass
-    for (let x = 0; x < W; x++) {
-      let run = 0, maxRun = 0;
-      for (let y = 0; y < H; y++) {
-        const i = (y * W + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        if (lum < darkThr) { run++; if (run > maxRun) maxRun = run; }
-        else run = 0;
-      }
-      colDarkRun[x] = maxRun;
-    }
 
     octx.fillStyle = '#ffffff';
-    // Mask horizontal rules: any single row with a dark run longer than minLen
-    // AND not part of a "fat" block (next ±maxThickness rows aren't all this
-    // long → it's a thin rule, not a filled rectangle / image).
+    // Mask HORIZONTAL rules only. Vertical rules are intentionally preserved
+    // because Tesseract leans on them to keep adjacent cells separate — wipe
+    // them and "업체명 (주)와이유 대표자 유정태" fuses into a single OCR line.
     for (let y = 0; y < H; y++) {
       if (rowDarkRun[y] < minLen) continue;
       let thickness = 1;
@@ -90,20 +77,7 @@ export function suppressTableLines(srcCanvas, opts = {}) {
       }
       if (thickness <= maxThickness) {
         octx.fillRect(0, Math.max(0, y - 1), W, thickness + 2);
-        y += thickness; // skip the rest of the rule
-      }
-    }
-    // Mask vertical rules (same logic)
-    for (let x = 0; x < W; x++) {
-      if (colDarkRun[x] < minLen) continue;
-      let thickness = 1;
-      for (let dx = 1; dx <= maxThickness + 1 && x + dx < W; dx++) {
-        if (colDarkRun[x + dx] >= minLen * 0.7) thickness++;
-        else break;
-      }
-      if (thickness <= maxThickness) {
-        octx.fillRect(Math.max(0, x - 1), 0, thickness + 2, H);
-        x += thickness;
+        y += thickness;
       }
     }
     return out;

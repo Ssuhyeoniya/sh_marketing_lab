@@ -215,9 +215,19 @@ button { font-family: inherit; }
 .canvas-toolbar {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  display: flex; justify-content: space-between; align-items: center;
-  gap: 10px; flex-wrap: wrap;
+  /* Fixed 3-column grid: left info (truncates if too long) | centre mode
+     bar (kept on its own grid cell, never shifts) | right action buttons.
+     Without the grid the mode bar floated on flex space-between and moved
+     every time the left "mode hint" string changed length. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
 }
+.canvas-toolbar > :first-child {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.canvas-toolbar > :last-child { justify-self: end; }
 .canvas-area {
   flex: 1; overflow: auto; padding: 24px;
   display: flex; align-items: flex-start; justify-content: center;

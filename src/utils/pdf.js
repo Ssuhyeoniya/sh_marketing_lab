@@ -112,61 +112,12 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
       hasEOL: !!it.hasEOL,
     });
   }
-  // pdfjs already groups text by content-stream segments. The opposite
-  // problem of word-splitting: a visual sentence often comes through as
-  // many tiny items (one per kerning adjustment / font switch / cell), so
-  // selecting the sentence forces the user to edit each fragment.
-  // Merge items that share a baseline AND font face AND sit close enough
-  // horizontally to be part of the same run.
-  const merged = mergeSameBaselineItems(items);
-  return { items: merged, styles: tc.styles || {} };
-}
-
-// Merge text items that fall on the same baseline, use the same font, and
-// sit within a reasonable advance distance of each other. Anything else
-// (different baseline → different line; big horizontal gap → table cell
-// boundary) stays separate.
-function mergeSameBaselineItems(items) {
-  if (items.length < 2) return items;
-  // Group by quantised baseY + font signature.
-  const groups = new Map();
-  for (const it of items) {
-    const baseYBucket = Math.round(it.baseY); // 1-px tolerance via rounding
-    const key = `${baseYBucket}|${it.fontName}|${Math.round(it.fontSize)}|${Math.round(it.angleDeg)}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(it);
-  }
-  const out = [];
-  for (const group of groups.values()) {
-    // Sort left-to-right (or right-to-left for rotated; using x is fine as
-    // a heuristic — same-baseline groups for rotated text are rare).
-    group.sort((a, b) => a.x - b.x);
-    let cur = { ...group[0] };
-    for (let i = 1; i < group.length; i++) {
-      const it = group[i];
-      const gap = it.x - (cur.x + cur.w);
-      // 2× fontSize is a generous "same sentence" threshold — wider than a
-      // typical word space (0.3×) but narrower than a table cell gap (>3×).
-      const sameRun = gap >= -2 && gap < cur.fontSize * 2.2;
-      if (sameRun) {
-        // Insert a space if the visual gap was larger than a hair-space.
-        const needsSpace = gap > cur.fontSize * 0.15
-          && !/\s$/.test(cur.text) && !/^\s/.test(it.text);
-        cur.text = cur.text + (needsSpace ? ' ' : '') + it.text;
-        const newRight = it.x + it.w;
-        cur.w = newRight - cur.x;
-        // hasEOL stays from the LAST item we absorbed.
-        cur.hasEOL = it.hasEOL;
-      } else {
-        out.push(cur);
-        cur = { ...it };
-      }
-    }
-    out.push(cur);
-  }
-  // Preserve original document order roughly by baseY then x.
-  out.sort((a, b) => (a.baseY - b.baseY) || (a.x - b.x));
-  return out;
+  // Return pdfjs's items verbatim. Each text item is a content-stream
+  // segment — for tables that means one item per cell, which is exactly
+  // the granularity the user wants to edit. Any same-baseline "merging"
+  // we attempt here will fuse adjacent cells into a single row-wide
+  // layer (the bug the user just hit), so we leave items alone.
+  return { items, styles: tc.styles || {} };
 }
 
 export async function pdfToImages(file, format = 'png', scale = 2) {
