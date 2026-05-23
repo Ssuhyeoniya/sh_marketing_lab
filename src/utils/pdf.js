@@ -53,6 +53,12 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
     if (!it || it.type) continue; // marked-content boundaries
     if (!it.str || !it.str.trim()) continue;
     if (!it.transform || it.transform.length < 6) continue;
+    // First-line defence against logo glyphs and border decorations: drop
+    // any item that doesn't contain a single Latin letter, digit or hangul
+    // syllable. Box-drawing items, Private-Use-Area-encoded logo glyphs
+    // ("YU" rendered through a custom symbol font), and PDFs that emit
+    // rule lines as font characters are all caught here.
+    if (!hasTextContent(it.str)) continue;
     const tx = composeAffine(viewport.transform, it.transform);
     const baseX = tx[4];
     const baseY = tx[5];
@@ -123,39 +129,65 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
   return { items: split, styles: tc.styles || {} };
 }
 
-// Split a text item into per-cell fragments when its text contains runs
-// of 2+ consecutive whitespace characters (cell-padding signature).
+// Characters that look like table borders / rules — never part of real text
+// in our context. Box-drawing range U+2500-257F, ASCII pipe, IDEOGRAPHIC fullwidth
+// pipe. Used both to detect cell boundaries inside a combined pdfjs item AND
+// to strip residual border glyphs from the final text.
+const BORDER_CHARS = /[─-╿\|｜]/g;
+const BORDER_GAP = /[─-╿\|｜]+|\s{2,}/g; // splitter pattern
+
+// Does the string contain any actual text content (letter, digit, hangul)?
+// Items that fail this filter are pure decoration — logo glyphs, divider rows,
+// table rules. Skipping them is what "이미지나 선은 잡지 말고 오직 텍스트만 잡아라"
+// translates to in code.
+function hasTextContent(s) {
+  return /[a-zA-Z0-9가-힣ㄱ-ㅎㅏ-ㅣ]/.test(s);
+}
+
+// Split a text item into per-cell fragments. Splits on:
+//   - 2+ consecutive whitespace (cell-padding signature, the most reliable hint)
+//   - ASCII | / fullwidth ｜ / Unicode box-drawing chars (when pdfjs returns
+//     a cell border as a glyph alongside the cell text)
+// Fragments without any letter/digit/hangul are dropped entirely.
 // Position/width are estimated with UNIFORM char-width — not exact for
-// proportional fonts, but doesn't depend on font availability and is
-// always within a few px of the truth. For items WITHOUT such gaps the
-// item is returned unchanged.
+// proportional fonts but doesn't depend on font availability.
 function splitAtCellGaps(it) {
   const text = it.text || '';
-  if (!/\s{2,}/.test(text)) return [it];
-  const parts = text.split(/(\s{2,})/); // keep gap runs as separators
-  if (parts.length < 3) return [it]; // shouldn't happen but be safe
+  if (!BORDER_GAP.test(text)) {
+    BORDER_GAP.lastIndex = 0;
+    // Even if there's no internal split, drop the item if it's pure decoration.
+    return hasTextContent(text) ? [{ ...it, text: text.replace(BORDER_CHARS, '').trim() }] : [];
+  }
+  BORDER_GAP.lastIndex = 0;
+  // Walk segments by replacing gaps with a sentinel we can split on without
+  // losing position info.
+  const parts = text.split(BORDER_GAP);
+  const gaps = text.match(BORDER_GAP) || [];
   const charW = it.w / Math.max(1, text.length);
   const out = [];
   let cursor = 0;
-  for (const part of parts) {
-    if (/^\s{2,}$/.test(part)) {
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part) {
+      const trimmed = part.trim();
+      if (trimmed && hasTextContent(trimmed)) {
+        const leading = part.length - part.replace(/^\s+/, '').length;
+        const xOffset = (cursor + leading) * charW;
+        // Width = the trimmed portion's character count × uniform char width
+        const wPart = trimmed.length * charW;
+        out.push({
+          ...it,
+          text: trimmed.replace(BORDER_CHARS, '').trim(),
+          x: it.x + xOffset,
+          w: wPart,
+        });
+      }
       cursor += part.length;
-      continue;
     }
-    const trimmed = part.replace(/^\s+|\s+$/g, '');
-    if (!trimmed) { cursor += part.length; continue; }
-    const leading = part.length - part.replace(/^\s+/, '').length;
-    const xOffset = (cursor + leading) * charW;
-    const wPart = trimmed.length * charW;
-    out.push({
-      ...it,
-      text: trimmed,
-      x: it.x + xOffset,
-      w: wPart,
-    });
-    cursor += part.length;
+    if (i < gaps.length) cursor += gaps[i].length;
   }
-  return out.length ? out : [it];
+  // Drop fragments that ended up empty after the border strip.
+  return out.filter((s) => s.text && hasTextContent(s.text));
 }
 
 export async function pdfToImages(file, format = 'png', scale = 2) {
