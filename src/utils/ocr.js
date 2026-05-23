@@ -5,10 +5,21 @@ let workerCache = null;
 export async function getWorker() {
   if (workerCache) return workerCache;
   workerCache = await Tesseract.createWorker(['kor', 'eng']);
-  // PSM 6 = uniform block of text — works much better on UI screenshots / mockups
-  // than the default auto (which tends to skip parts of Korean syllable blocks).
+  // Wider language coverage:
+  //   - PSM 6 (uniform block) is the most reliable on document scans /
+  //     screenshots. PSM 11 (sparse text) is better for tables but loses
+  //     line grouping; we stick with 6 and pre-process the image to remove
+  //     table rules so cells get treated as normal text blocks.
+  //   - preserve_interword_spaces=1 makes Tesseract emit a SPACE between
+  //     adjacent words even when the gap is small; without this, Korean
+  //     mixed with Latin/numerics often collapses into one token.
+  //   - tessedit_char_blacklist left empty (we want every glyph).
   try {
-    await workerCache.setParameters({ tessedit_pageseg_mode: '6' });
+    await workerCache.setParameters({
+      tessedit_pageseg_mode: '6',
+      preserve_interword_spaces: '1',
+      user_defined_dpi: '300',
+    });
   } catch {}
   return workerCache;
 }
@@ -18,6 +29,87 @@ export async function recognizeImage(src, onProgress) {
   if (onProgress) worker.setProgressHandler?.(onProgress);
   const { data } = await worker.recognize(src);
   return data;
+}
+
+// Detect long, thin runs of dark pixels (table borders) and paint over them
+// with the local background colour so OCR isn't disrupted by ruled lines
+// crossing or hugging glyphs. Returns a NEW canvas — original untouched so
+// colour sampling for final rendering still uses the real pixels.
+export function suppressTableLines(srcCanvas, opts = {}) {
+  const minLen = opts.minLen ?? Math.min(srcCanvas.width, srcCanvas.height) * 0.15;
+  const maxThickness = opts.maxThickness ?? 3;
+  const darkThr = opts.darkThr ?? 110; // mean luminance threshold for "dark"
+  try {
+    const out = document.createElement('canvas');
+    out.width = srcCanvas.width;
+    out.height = srcCanvas.height;
+    const sctx = srcCanvas.getContext('2d');
+    const octx = out.getContext('2d');
+    octx.drawImage(srcCanvas, 0, 0);
+    const W = srcCanvas.width, H = srcCanvas.height;
+    const img = sctx.getImageData(0, 0, W, H);
+    const data = img.data;
+    // Per-row luminance summary
+    const rowDarkRun = new Array(H).fill(0); // longest dark run on each row
+    const colDarkRun = new Array(W).fill(0); // longest dark run on each col
+
+    // Horizontal pass
+    for (let y = 0; y < H; y++) {
+      let run = 0, maxRun = 0;
+      const rowStart = y * W * 4;
+      for (let x = 0; x < W; x++) {
+        const i = rowStart + x * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum < darkThr) { run++; if (run > maxRun) maxRun = run; }
+        else run = 0;
+      }
+      rowDarkRun[y] = maxRun;
+    }
+    // Vertical pass
+    for (let x = 0; x < W; x++) {
+      let run = 0, maxRun = 0;
+      for (let y = 0; y < H; y++) {
+        const i = (y * W + x) * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum < darkThr) { run++; if (run > maxRun) maxRun = run; }
+        else run = 0;
+      }
+      colDarkRun[x] = maxRun;
+    }
+
+    octx.fillStyle = '#ffffff';
+    // Mask horizontal rules: any single row with a dark run longer than minLen
+    // AND not part of a "fat" block (next ±maxThickness rows aren't all this
+    // long → it's a thin rule, not a filled rectangle / image).
+    for (let y = 0; y < H; y++) {
+      if (rowDarkRun[y] < minLen) continue;
+      let thickness = 1;
+      for (let dy = 1; dy <= maxThickness + 1 && y + dy < H; dy++) {
+        if (rowDarkRun[y + dy] >= minLen * 0.7) thickness++;
+        else break;
+      }
+      if (thickness <= maxThickness) {
+        octx.fillRect(0, Math.max(0, y - 1), W, thickness + 2);
+        y += thickness; // skip the rest of the rule
+      }
+    }
+    // Mask vertical rules (same logic)
+    for (let x = 0; x < W; x++) {
+      if (colDarkRun[x] < minLen) continue;
+      let thickness = 1;
+      for (let dx = 1; dx <= maxThickness + 1 && x + dx < W; dx++) {
+        if (colDarkRun[x + dx] >= minLen * 0.7) thickness++;
+        else break;
+      }
+      if (thickness <= maxThickness) {
+        octx.fillRect(Math.max(0, x - 1), 0, thickness + 2, H);
+        x += thickness;
+      }
+    }
+    return out;
+  } catch {
+    return srcCanvas;
+  }
 }
 
 // Canonical font set — also used to populate dropdowns and font preloads.
