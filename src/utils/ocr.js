@@ -82,51 +82,98 @@ export const SYSTEM_FONTS = [
   { name: 'Courier',              family: '"Courier New", Courier, monospace',                   weight: 400, kind: 'mono' },
 ];
 
-function findFont({ kind, script, weight }) {
+function findFont({ kind, script, weight, preferBoldName = false }) {
   const wantBold = weight >= 600;
   // Score by kind/script/weight match
-  let best = SYSTEM_FONTS[0], bestScore = -1;
+  let best = SYSTEM_FONTS[0], bestScore = -Infinity;
   for (const f of SYSTEM_FONTS) {
     let s = 0;
-    if (kind && f.kind === kind) s += 3;
-    if (script && f.script === script) s += 2;
-    if (wantBold && f.weight >= 600) s += 2;
-    if (!wantBold && f.weight < 600) s += 2;
+    if (kind && f.kind === kind) s += 4;
+    else if (kind === 'sans' && f.kind === 'serif') s -= 4;
+    if (script && f.script === script) s += 3;
+    else if (!f.script) s += 1;
+    else if (script === 'ko' && f.script === 'lat') s -= 6;
+    if (wantBold) {
+      if (f.weight >= 700) s += 3;
+      else if (f.weight >= 600) s += 2;
+      else s -= 2;
+      // Prefer entries that ALSO advertise a Bold name so the dropdown
+      // surfaces an explicit Bold face.
+      if (preferBoldName && /\bbold|black|heavy\b/i.test(f.name)) s += 2;
+    } else {
+      if (f.weight >= 600) s -= 2;
+      else s += 2;
+    }
     if (s > bestScore) { bestScore = s; best = f; }
   }
   return best;
 }
 
-// Font matcher using Tesseract word metadata when present, plus pixel-density fallback.
-// Returns { font, size, weight } where font = { name, family, weight }.
+// Font matcher using Tesseract word metadata when present, plus stroke-width
+// fallback for bold detection. Returns { font, size, weight, isBold, isItalic }.
 export function guessFont(word, imageCanvas) {
-  if (!word || !word.bbox) return { font: SYSTEM_FONTS[0], size: 14, weight: 400 };
+  if (!word || !word.bbox) return { font: SYSTEM_FONTS[0], size: 14, weight: 400, isBold: false, isItalic: false };
   const { x0, y0, x1, y1 } = word.bbox;
   const height = Math.max(8, y1 - y0);
+  const width = Math.max(2, x1 - x0);
   const text = word.text || '';
   const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(text);
 
   // Read Tesseract-provided font hints when available.
   let isBold = !!word.is_bold;
+  let isItalic = !!word.is_italic;
   let isSerif = !!word.is_serif;
   let isMono = !!word.is_monospace;
+  let boldConfidence = 0; // 0..1, used to break ties on borderline cases
 
-  // Heuristic boldness from black-pixel density (covers cases where Tesseract omits the flag).
-  if (!isBold) {
+  // Stroke-width heuristic. For each scan line in the bbox, find runs of dark
+  // pixels (= stroke crossings) and take the median run length. The median
+  // stroke width divided by glyph height is a robust bold signal across
+  // scripts — Korean glyphs naturally have more strokes so a flat
+  // pixel-density threshold (the old 30 % rule) over-triggers; stroke width
+  // per row is invariant to glyph complexity.
+  if (imageCanvas) {
     try {
-      if (imageCanvas) {
-        const ctx = imageCanvas.getContext('2d');
-        const w = x1 - x0, h = y1 - y0;
-        if (w > 1 && h > 1) {
-          const data = ctx.getImageData(x0, y0, w, h).data;
-          let dark = 0, total = 0;
-          for (let i = 0; i < data.length; i += 4) {
-            const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-            if (lum < 128) dark++;
-            total++;
-          }
-          if (dark / total > 0.30) isBold = true;
+      const ctx = imageCanvas.getContext('2d');
+      // Sample at most the first ~200px wide window — enough to characterise
+      // the face, cheap on large headlines.
+      const w = Math.min(width, 240);
+      const h = Math.min(height, 80);
+      const data = ctx.getImageData(x0, y0, w, h).data;
+      const rowStrokes = [];
+      // Mean luminance of the row's pixels → adaptive threshold per row.
+      for (let y = 0; y < h; y++) {
+        const rowStart = y * w * 4;
+        let lumSum = 0;
+        for (let x = 0; x < w; x++) {
+          const i = rowStart + x * 4;
+          lumSum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
         }
+        const rowMean = lumSum / w;
+        // 70 % between row mean and pure-black is "dark" — keeps thresholds
+        // adaptive to coloured / anti-aliased text.
+        const thr = Math.min(160, rowMean - 30);
+        const runs = [];
+        let runLen = 0;
+        for (let x = 0; x < w; x++) {
+          const i = rowStart + x * 4;
+          const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          if (lum < thr) runLen++;
+          else if (runLen > 0) { runs.push(runLen); runLen = 0; }
+        }
+        if (runLen > 0) runs.push(runLen);
+        if (runs.length) rowStrokes.push(median(runs));
+      }
+      if (rowStrokes.length > 4) {
+        const stroke = median(rowStrokes);
+        const ratio = stroke / h;
+        // Empirical thresholds — calibrated against Pretendard / Noto Sans KR /
+        // Helvetica at common sizes:
+        //   regular: ratio ≈ 0.06–0.10
+        //   semi   : ratio ≈ 0.11–0.14
+        //   bold   : ratio ≈ 0.15–0.22
+        const boldThreshold = isKorean ? 0.155 : 0.130;
+        if (ratio > boldThreshold) { isBold = true; boldConfidence = Math.min(1, (ratio - boldThreshold) * 8); }
       }
     } catch {}
   }
@@ -134,7 +181,9 @@ export function guessFont(word, imageCanvas) {
   const kind = isMono ? 'mono' : isSerif ? 'serif' : 'sans';
   const script = isKorean ? 'ko' : 'lat';
   const weight = isBold ? 700 : 400;
-  const match = findFont({ kind, script, weight });
+  // Pass isBold so findFont can prefer entries with "Bold" in the name when
+  // possible (so the dropdown reads "Pretendard Bold", not bare "Pretendard").
+  const match = findFont({ kind, script, weight, preferBoldName: isBold });
 
   // Prefer Tesseract font_size when reasonable; otherwise derive from bbox height.
   const tsize = Number(word.font_size);
@@ -143,7 +192,13 @@ export function guessFont(word, imageCanvas) {
       ? Math.round(tsize)
       : Math.round(height * (isKorean ? 0.88 : 0.78));
 
-  return { font: match, size, weight };
+  return { font: match, size, weight, isBold, isItalic, boldConfidence };
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const sorted = arr.slice().sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
 }
 
 // Direct-name nicknames so common PDF-embedded faces resolve to a specific
