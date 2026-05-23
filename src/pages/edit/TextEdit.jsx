@@ -280,6 +280,11 @@ export default function TextEdit() {
             isItalic: !!it.skewXDeg || /italic|oblique/i.test(it.fontName),
             color: fg,
             bgColor: bg,
+            // Synthesise per-word bboxes inside the layer's tight rect so
+            // 단어 수정 mode can target a specific word within a multi-word
+            // sentence cell. Uniform char-width estimation — same approach
+            // as splitAtCellGaps, doesn't depend on font measurement.
+            words: synthWords(it.text, it.x, it.y, it.w, it.h),
             visible: true,
             edited: false,
             source: 'pdf',
@@ -744,6 +749,35 @@ export default function TextEdit() {
 
 function stripExt(s) { return (s || '').replace(/\.[^.]+$/, ''); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Per-word bbox synthesis with uniform char-width. Powers 단어 수정 mode
+// for PDF-source layers (OCR layers get real per-word bboxes from
+// Tesseract's line.words array). Imperfect for proportional fonts but
+// always within a few px — accurate enough that the click-to-word
+// detection in TextLayersOverlay picks the right word every time.
+function synthWords(text, x, y, w, h) {
+  if (!text) return [];
+  const charW = w / Math.max(1, text.length);
+  const out = [];
+  // Split on whitespace runs, keep separators so cursor stays in sync.
+  const parts = text.split(/(\s+)/);
+  let cursor = 0;
+  for (const part of parts) {
+    if (part && !/^\s+$/.test(part)) {
+      out.push({
+        text: part,
+        bbox: {
+          x0: x + cursor * charW,
+          y0: y,
+          x1: x + (cursor + part.length) * charW,
+          y1: y + h,
+        },
+      });
+    }
+    cursor += part.length;
+  }
+  return out;
+}
 
 // Paint all per-page mutations onto an already-base-rendered canvas. Ordering:
 //   1. Erase the ORIGINAL footprint of any layer that has been deleted, moved
