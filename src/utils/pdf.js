@@ -68,17 +68,14 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
     const yProjOnX = (tx[2] * Math.cos(rotRad) + tx[3] * Math.sin(rotRad)) / xBasisLen;
     const skewXRad = Math.abs(yProjOnX) > 0.02 ? Math.atan2(yProjOnX, yBasisLen) : 0;
     const skewXDeg = (skewXRad * 180) / Math.PI;
-    // pdfjs reports two height-related quantities:
-    //   1. Math.hypot(tx[2], tx[3])   — derived from the text matrix, which
-    //      can be inflated by font-size scaling tricks (e.g. Tf 1pt + Tm 12x).
-    //   2. it.height * canvasScale    — the on-screen height of the visible
-    //      glyph box. This is what the user actually sees rendered.
-    // Use (2) as the canonical font size when available so the inline editor
-    // and the canvas redraw match the original glyph footprint exactly. Fall
-    // back to (1) only when pdfjs didn't supply a sensible height.
+    // FontDescriptor-derived height is the most reliable size signal —
+    // it's the visible glyph box in user-units, which is what the user
+    // sees. The text matrix's y-basis (yBasisLen / transformHeight) can
+    // be inflated by Tf/Tm scaling tricks and is treated as a fallback
+    // only when item.height is missing.
     const transformHeight = Math.hypot(tx[2], tx[3]);
     const itemHeight = Math.abs(it.height || 0) * canvasScale;
-    const fontSize = yBasisLen > 2 ? yBasisLen : (itemHeight > 2 ? itemHeight : transformHeight);
+    const fontSize = itemHeight > 2 ? itemHeight : (yBasisLen > 2 ? yBasisLen : transformHeight);
     if (!isFinite(fontSize) || fontSize < 1) continue;
     const wCanvas = (it.width || 0) * canvasScale;
     // pdfjs's styles map carries the FontDescriptor-derived data per font:
@@ -112,12 +109,53 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
       hasEOL: !!it.hasEOL,
     });
   }
-  // Return pdfjs's items verbatim. Each text item is a content-stream
-  // segment — for tables that means one item per cell, which is exactly
-  // the granularity the user wants to edit. Any same-baseline "merging"
-  // we attempt here will fuse adjacent cells into a single row-wide
-  // layer (the bug the user just hit), so we leave items alone.
-  return { items, styles: tc.styles || {} };
+  // Cell-boundary splitting. pdfjs sometimes combines adjacent text runs
+  // from different cells into a SINGLE item — typically when a PDF emits
+  // them in one TJ operator with explicit kerning gaps. We detect those
+  // combined items by looking for runs of 2+ consecutive whitespace
+  // characters (real cell text uses single spaces between words; only
+  // cell-padding gaps reach 2+ spaces) and split there.
+  const split = [];
+  for (const it of items) {
+    const segs = splitAtCellGaps(it);
+    for (const s of segs) split.push(s);
+  }
+  return { items: split, styles: tc.styles || {} };
+}
+
+// Split a text item into per-cell fragments when its text contains runs
+// of 2+ consecutive whitespace characters (cell-padding signature).
+// Position/width are estimated with UNIFORM char-width — not exact for
+// proportional fonts, but doesn't depend on font availability and is
+// always within a few px of the truth. For items WITHOUT such gaps the
+// item is returned unchanged.
+function splitAtCellGaps(it) {
+  const text = it.text || '';
+  if (!/\s{2,}/.test(text)) return [it];
+  const parts = text.split(/(\s{2,})/); // keep gap runs as separators
+  if (parts.length < 3) return [it]; // shouldn't happen but be safe
+  const charW = it.w / Math.max(1, text.length);
+  const out = [];
+  let cursor = 0;
+  for (const part of parts) {
+    if (/^\s{2,}$/.test(part)) {
+      cursor += part.length;
+      continue;
+    }
+    const trimmed = part.replace(/^\s+|\s+$/g, '');
+    if (!trimmed) { cursor += part.length; continue; }
+    const leading = part.length - part.replace(/^\s+/, '').length;
+    const xOffset = (cursor + leading) * charW;
+    const wPart = trimmed.length * charW;
+    out.push({
+      ...it,
+      text: trimmed,
+      x: it.x + xOffset,
+      w: wPart,
+    });
+    cursor += part.length;
+  }
+  return out.length ? out : [it];
 }
 
 export async function pdfToImages(file, format = 'png', scale = 2) {
