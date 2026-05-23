@@ -112,7 +112,45 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
       hasEOL: !!it.hasEOL,
     });
   }
-  return { items, styles: tc.styles || {} };
+  // Word-level splitting. pdfjs's text content often groups a whole visual
+  // line into a single "item" — handy for layout but bad for editing because
+  // selecting one word forces the editor to load the whole line. Split each
+  // item that contains whitespace into per-word sub-items, distributing the
+  // original bbox width proportionally across the measured character widths.
+  const splitItems = [];
+  let _mctx = null;
+  const measure = (font) => {
+    if (!_mctx) _mctx = document.createElement('canvas').getContext('2d');
+    _mctx.font = font;
+    return _mctx;
+  };
+  for (const it of items) {
+    if (!/\s/.test(it.text) || it.text.trim().length < 2) {
+      splitItems.push(it);
+      continue;
+    }
+    const parts = it.text.split(/(\s+)/); // keep separators so widths line up
+    const font = `${it.fontSize}px ${it.pdfFamily ? `"${it.pdfFamily}", ` : ''}sans-serif`;
+    const mctx = measure(font);
+    const totalNative = mctx.measureText(it.text).width || 1;
+    const xScale = it.w / totalNative;
+    let cursor = 0;
+    for (const part of parts) {
+      const wPart = mctx.measureText(part).width;
+      if (part.trim()) {
+        const xPart = it.x + cursor * xScale;
+        const wPartCanvas = wPart * xScale;
+        splitItems.push({
+          ...it,
+          text: part,
+          x: xPart,
+          w: wPartCanvas,
+        });
+      }
+      cursor += wPart;
+    }
+  }
+  return { items: splitItems, styles: tc.styles || {} };
 }
 
 export async function pdfToImages(file, format = 'png', scale = 2) {
