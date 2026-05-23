@@ -56,15 +56,22 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
     const tx = composeAffine(viewport.transform, it.transform);
     const baseX = tx[4];
     const baseY = tx[5];
-    const fontSize = Math.hypot(tx[2], tx[3]);
-    if (!isFinite(fontSize) || fontSize < 1) continue;
     const angleDeg = (Math.atan2(tx[1], tx[0]) * 180) / Math.PI;
-    // item.width / item.height are in PDF user units → canvas-px via canvasScale
+    // pdfjs reports two height-related quantities:
+    //   1. Math.hypot(tx[2], tx[3])   — derived from the text matrix, which
+    //      can be inflated by font-size scaling tricks (e.g. Tf 1pt + Tm 12x).
+    //   2. it.height * canvasScale    — the on-screen height of the visible
+    //      glyph box. This is what the user actually sees rendered.
+    // Use (2) as the canonical font size when available so the inline editor
+    // and the canvas redraw match the original glyph footprint exactly. Fall
+    // back to (1) only when pdfjs didn't supply a sensible height.
+    const transformHeight = Math.hypot(tx[2], tx[3]);
+    const itemHeight = Math.abs(it.height || 0) * canvasScale;
+    const fontSize = itemHeight > 2 ? itemHeight : transformHeight;
+    if (!isFinite(fontSize) || fontSize < 1) continue;
     const wCanvas = (it.width || 0) * canvasScale;
-    const hCanvas = (it.height || fontSize / canvasScale) * canvasScale;
-    // Ascent/descent approximation when not provided by pdfjs styles.
-    const ascent = fontSize * 0.82;
-    const descent = fontSize * 0.18;
+    const ascent = fontSize * 0.84;
+    const descent = fontSize * 0.16;
     items.push({
       text: it.str,
       fontName: it.fontName || '',
@@ -74,7 +81,7 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
       y: baseY - ascent,
       baseY,
       w: Math.max(wCanvas, fontSize * 0.5),
-      h: hCanvas > 1 ? hCanvas : ascent + descent,
+      h: fontSize, // exactly match fontSize so the editor box and the glyphs align
       ascent,
       descent,
       hasEOL: !!it.hasEOL,

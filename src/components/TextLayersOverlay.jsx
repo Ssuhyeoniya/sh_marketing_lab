@@ -1,20 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 
 /**
- * Figma-style interactive overlay for OCR text layers.
- * - Each layer renders as a rectangle on the canvas.
- * - Single click → select.
- * - Drag (mousedown + move) → reposition (sets edited=true).
- * - Double click → inline edit text.
- * - Click outside → deselect.
- *
- * Props:
- *   layers           — array of { id, text, x, y, w, h, fontFamily, fontSize, fontWeight, color, bgColor, edited }
- *   offsetX, offsetY — display-pixel offset of the screen image inside the wrapper
- *   scale            — display scale; layer coords (image-px) * scale = display-px
- *   selectedId       — currently selected layer id, or null
- *   onSelect(id)
- *   onUpdate(id, patch) — patch is partial layer
+ * ezPDF-style interactive overlay for PDF/OCR text layers.
+ * Behaviour is driven by `editMode`:
+ *   - 'sentence'    : click=select+drag, double-click=edit whole line.
+ *   - 'word'        : single click on a layer opens the editor with the word
+ *                     under the cursor pre-selected (so retyping replaces it).
+ *   - 'delete-text' : single click on a layer removes that text (covers it
+ *                     with the sampled bg colour). Drag does nothing.
+ *   - 'delete-area' : drag on empty canvas to paint a rectangular erase region
+ *                     (covers everything inside, including images, with white).
  */
 export default function TextLayersOverlay({
   layers,
@@ -24,10 +19,21 @@ export default function TextLayersOverlay({
   selectedId,
   onSelect,
   onUpdate,
+  editMode = 'sentence',
+  eraseRegions = [],
+  onDeleteLayer,
+  onAreaErase,
+  onAreaEraseDelete,
 }) {
   const [drag, setDrag] = useState(null);
   const [editingId, setEditingId] = useState(null);
+  const [editingCaret, setEditingCaret] = useState(null); // [start, end] selection on focus
+  const [areaDrag, setAreaDrag] = useState(null); // for delete-area mode
 
+  // Exit edit mode when switching modes.
+  useEffect(() => { setEditingId(null); setDrag(null); setAreaDrag(null); }, [editMode]);
+
+  // Layer drag handler (sentence mode).
   useEffect(() => {
     if (!drag) return;
     let moved = false;
@@ -47,15 +53,91 @@ export default function TextLayersOverlay({
     };
   }, [drag, scale, onUpdate]);
 
+  // Area-erase drag handler.
+  useEffect(() => {
+    if (!areaDrag || areaDrag.committed) return;
+    const onMove = (e) => {
+      setAreaDrag((d) => d && { ...d, cx: e.clientX, cy: e.clientY });
+    };
+    const onUp = () => {
+      setAreaDrag((d) => {
+        if (!d) return null;
+        const rect = d.containerRect;
+        const x1 = Math.min(d.sx, d.cx ?? d.sx) - rect.left;
+        const y1 = Math.min(d.sy, d.cy ?? d.sy) - rect.top;
+        const x2 = Math.max(d.sx, d.cx ?? d.sx) - rect.left;
+        const y2 = Math.max(d.sy, d.cy ?? d.sy) - rect.top;
+        const w = x2 - x1, h = y2 - y1;
+        if (w > 4 && h > 4) {
+          onAreaErase?.({
+            x: Math.round(x1 / scale),
+            y: Math.round(y1 / scale),
+            w: Math.round(w / scale),
+            h: Math.round(h / scale),
+          });
+        }
+        return null;
+      });
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [areaDrag, scale, onAreaErase]);
+
+  const wrapPointerEvents = editMode === 'delete-area' ? 'auto' : 'none';
+
   return (
     <div
-      style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
+      style={{
+        position: 'absolute', inset: 0,
+        pointerEvents: wrapPointerEvents,
+        cursor: editMode === 'delete-area' ? 'crosshair' : 'default',
+      }}
+      onMouseDown={(e) => {
+        if (editMode !== 'delete-area') return;
+        if (e.target !== e.currentTarget) return; // don't start on erase-region overlays
+        const rect = e.currentTarget.getBoundingClientRect();
+        setAreaDrag({ sx: e.clientX, sy: e.clientY, cx: e.clientX, cy: e.clientY, containerRect: rect });
+      }}
       onClick={(e) => {
-        // Click on empty area deselects
-        if (e.target === e.currentTarget) onSelect?.(null);
+        if (e.target === e.currentTarget && editMode !== 'delete-area') onSelect?.(null);
       }}
     >
+      {/* Existing erase regions — clickable in delete-area mode to remove. */}
+      {eraseRegions.map((r, i) => (
+        <div
+          key={`er-${i}`}
+          onClick={(e) => {
+            if (editMode !== 'delete-area') return;
+            e.stopPropagation();
+            onAreaEraseDelete?.(i);
+          }}
+          title={editMode === 'delete-area' ? '클릭하여 영역 삭제 취소' : undefined}
+          style={{
+            position: 'absolute',
+            left: offsetX + r.x * scale,
+            top: offsetY + r.y * scale,
+            width: r.w * scale,
+            height: r.h * scale,
+            background: 'rgba(239,68,68,0.10)',
+            border: '1.5px dashed #ef4444',
+            pointerEvents: editMode === 'delete-area' ? 'auto' : 'none',
+            cursor: editMode === 'delete-area' ? 'not-allowed' : 'default',
+            boxSizing: 'border-box',
+          }}
+        />
+      ))}
+
+      {/* In-progress area-erase rect */}
+      {areaDrag && (
+        <div style={areaRectStyle(areaDrag)} />
+      )}
+
       {layers.map((l) => {
+        if (l.visible === false) return null;
         const isSelected = selectedId === l.id;
         const isEditing = editingId === l.id;
         const x = offsetX + l.x * scale;
@@ -73,21 +155,52 @@ export default function TextLayersOverlay({
             scale={scale}
             isSelected={isSelected}
             isEditing={isEditing}
+            editMode={editMode}
+            caretRange={isEditing ? editingCaret : null}
             onMouseDown={(e) => {
               if (isEditing) return;
+              if (editMode === 'delete-area') return;
               e.stopPropagation();
+              if (editMode === 'delete-text') {
+                onDeleteLayer?.(l.id);
+                return;
+              }
+              if (editMode === 'word') {
+                onSelect?.(l.id);
+                // Estimate the clicked character index from the X position
+                // within the layer's bounding rect, then expand to the
+                // surrounding word so retyping replaces only that word.
+                const cRect = e.currentTarget.getBoundingClientRect();
+                const relClickX = e.clientX - cRect.left;
+                const text = l.text || '';
+                const isWordCh = (ch) => /[\p{L}\p{N}_가-힣]/u.test(ch);
+                const approxIdx = Math.max(
+                  0,
+                  Math.min(text.length, Math.round((relClickX / cRect.width) * text.length))
+                );
+                let s = approxIdx, end = approxIdx;
+                while (s > 0 && isWordCh(text[s - 1])) s--;
+                while (end < text.length && isWordCh(text[end])) end++;
+                const sel = s === end ? [0, text.length] : [s, end];
+                setEditingCaret(sel);
+                setEditingId(l.id);
+                return;
+              }
+              // sentence mode: select + start drag
               onSelect?.(l.id);
               setDrag({ id: l.id, sx: e.clientX, sy: e.clientY, ox: l.x, oy: l.y });
             }}
             onDoubleClick={(e) => {
+              if (editMode === 'delete-text' || editMode === 'delete-area') return;
               e.stopPropagation();
               e.preventDefault();
               setDrag(null);
               onSelect?.(l.id);
+              setEditingCaret(null); // null → select all
               setEditingId(l.id);
             }}
             onTextChange={(text) => onUpdate(l.id, { text, edited: true })}
-            onCommit={() => setEditingId(null)}
+            onCommit={() => { setEditingId(null); setEditingCaret(null); }}
           />
         );
       })}
@@ -95,27 +208,40 @@ export default function TextLayersOverlay({
   );
 }
 
-function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseDown, onDoubleClick, onTextChange, onCommit }) {
+function areaRectStyle(d) {
+  const rect = d.containerRect;
+  const x1 = Math.min(d.sx, d.cx) - rect.left;
+  const y1 = Math.min(d.sy, d.cy) - rect.top;
+  const x2 = Math.max(d.sx, d.cx) - rect.left;
+  const y2 = Math.max(d.sy, d.cy) - rect.top;
+  return {
+    position: 'absolute',
+    left: x1, top: y1, width: x2 - x1, height: y2 - y1,
+    background: 'rgba(239,68,68,0.18)',
+    border: '1.5px dashed #ef4444',
+    pointerEvents: 'none',
+    boxSizing: 'border-box',
+  };
+}
+
+function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode, caretRange, onMouseDown, onDoubleClick, onTextChange, onCommit }) {
   const inputRef = useRef(null);
   const [hover, setHover] = useState(false);
   useEffect(() => {
     if (isEditing && inputRef.current) {
       inputRef.current.focus();
-      inputRef.current.select();
+      if (caretRange && caretRange.length === 2) {
+        try { inputRef.current.setSelectionRange(caretRange[0], caretRange[1]); } catch {}
+      } else {
+        inputRef.current.select();
+      }
     }
-  }, [isEditing]);
+  }, [isEditing, caretRange]);
 
-  // Display fontSize in CSS px — match OCR/PDF-detected size exactly,
-  // so the inline editor renders text at the same scale as the canvas output.
   const displayFontSize = (+l.fontSize || 14) * scale;
-  // CSS line baseline sits ~80% from top of the line box at line-height = 1.
-  // Move the input so its glyph baseline aligns with the layer's exact baseY.
-  // ascent ratio of the source glyphs within the bbox:
-  const ascentRatio = l.h > 0 ? (l.ascent ?? l.h * 0.82) / l.h : 0.82;
-  // Vertical offset to compensate for CSS's default baseline placement (~0.8).
-  const baselineNudge = (ascentRatio - 0.8) * h;
+  const lineH = displayFontSize;
+  const baselineNudge = Math.max(0, (h - lineH) / 2);
 
-  // Border styles by state — all clearly visible.
   let border, bg;
   if (isEditing) {
     border = '2px solid #3b82f6';
@@ -126,11 +252,20 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
   } else if (l.edited) {
     border = '1.5px solid #3b82f6';
     bg = 'rgba(59,130,246,0.05)';
+  } else if (editMode === 'delete-text') {
+    border = hover ? '1.5px solid #ef4444' : '1.5px dashed #fca5a5';
+    bg = hover ? 'rgba(239,68,68,0.12)' : 'rgba(239,68,68,0.04)';
   } else {
-    // Default OCR-detected box: clearly visible cyan outline + light tint.
     border = hover ? '1.5px solid #06b6d4' : '1.5px dashed #22d3ee';
     bg = hover ? 'rgba(34,211,238,0.10)' : 'rgba(34,211,238,0.04)';
   }
+
+  const cursor =
+    isEditing ? 'text' :
+    editMode === 'delete-text' ? 'not-allowed' :
+    editMode === 'delete-area' ? 'crosshair' :
+    editMode === 'word' ? 'text' :
+    'move';
 
   return (
     <>
@@ -139,7 +274,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
         onDoubleClick={onDoubleClick}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
-        title={isEditing ? '' : `"${l.text}" · 클릭=선택 · 드래그=이동 · 더블클릭=편집`}
+        title={isEditing ? '' : titleForMode(editMode, l.text)}
         style={{
           position: 'absolute',
           left: x,
@@ -148,8 +283,8 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
           height: h,
           border,
           background: bg,
-          cursor: isEditing ? 'text' : 'move',
-          pointerEvents: 'auto',
+          cursor,
+          pointerEvents: editMode === 'delete-area' ? 'none' : 'auto',
           boxSizing: 'border-box',
           transition: 'background-color 0.1s, border-color 0.1s',
         }}
@@ -175,14 +310,14 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
               top: baselineNudge,
               width: 'auto',
               minWidth: '100%',
-              height: '100%',
+              height: `${lineH}px`,
               whiteSpace: 'nowrap',
               border: 'none',
               outline: 'none',
               background: l.bgColor || '#ffffff',
               color: l.color || '#111111',
               fontSize: displayFontSize,
-              lineHeight: `${h}px`,
+              lineHeight: `${lineH}px`,
               fontFamily: l.fontFamily,
               fontWeight: l.fontWeight,
               letterSpacing: 0,
@@ -196,8 +331,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
           />
         )}
       </div>
-      {/* Small corner ticks at each corner so very small boxes are still spotted. */}
-      {!isEditing && !isSelected && (
+      {!isEditing && !isSelected && editMode !== 'delete-text' && (
         <>
           <CornerTick left={x} top={y} color={l.edited ? '#3b82f6' : '#06b6d4'} />
           <CornerTick left={x + w} top={y} color={l.edited ? '#3b82f6' : '#06b6d4'} />
@@ -211,7 +345,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
             position: 'absolute',
             left: x,
             top: Math.max(0, y - 22),
-            background: isSelected ? '#3b82f6' : '#06b6d4',
+            background: editMode === 'delete-text' ? '#ef4444' : (isSelected ? '#3b82f6' : '#06b6d4'),
             color: '#fff',
             fontSize: 10,
             padding: '2px 6px',
@@ -225,11 +359,23 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
             boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
           }}
         >
-          {l.text} · {l.fontSize}px
+          {labelForMode(editMode, l)}
         </div>
       )}
     </>
   );
+}
+
+function titleForMode(mode, text) {
+  if (mode === 'delete-text') return `클릭하여 "${text}" 삭제`;
+  if (mode === 'word') return `클릭한 단어만 편집 — "${text}"`;
+  if (mode === 'delete-area') return '드래그하여 영역 선택';
+  return `"${text}" · 클릭=선택 · 드래그=이동 · 더블클릭=문장 편집`;
+}
+function labelForMode(mode, l) {
+  if (mode === 'delete-text') return `삭제: ${l.text}`;
+  if (mode === 'word') return `단어 클릭하여 편집 · ${Math.round(l.fontSize)}px`;
+  return `${l.text} · ${Math.round(l.fontSize)}px`;
 }
 
 function CornerTick({ left, top, color }) {
