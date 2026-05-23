@@ -330,12 +330,17 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
               lineHeight: `${lineH}px`,
               fontFamily: l.fontFamily,
               fontWeight: l.fontWeight,
-              letterSpacing: 0,
+              // Preserve the PDF's letter-spacing (Tc) and synthetic italic
+              // skew so the inline editor matches the canvas output exactly.
+              letterSpacing: l.letterSpacing ? `${l.letterSpacing * scale}px` : 0,
               padding: 0,
               margin: 0,
               boxSizing: 'border-box',
               textAlign: 'left',
-              transform: l.angleDeg ? `rotate(${l.angleDeg}deg)` : undefined,
+              transform: [
+                l.angleDeg ? `rotate(${l.angleDeg}deg)` : '',
+                l.skewXDeg ? `skewX(${-l.skewXDeg}deg)` : '',
+              ].filter(Boolean).join(' ') || undefined,
               transformOrigin: '0 100%',
             }}
           />

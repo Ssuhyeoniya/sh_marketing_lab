@@ -267,3 +267,24 @@ function getMeasureCtx() {
   _measureCtx = c.getContext('2d');
   return _measureCtx;
 }
+
+// System Korean fonts that ship with the OS — used as a guaranteed-glyph
+// fallback so Korean text never falls through to a Latin-only system sans.
+export const KOREAN_FALLBACK = '"Apple SD Gothic Neo", "Malgun Gothic", "맑은 고딕", "Nanum Gothic", "Noto Sans KR"';
+export const LATIN_FALLBACK = '"Helvetica Neue", Helvetica, Arial';
+
+// Build a CSS font-family chain. Priority:
+//   1. The PDF's actual embedded font (pdfjs-registered family) — perfect fidelity
+//   2. The web font we matched by name + width similarity
+//   3. Script-appropriate system fallback (Korean OS fonts for ko, sans/serif for lat)
+//   4. Generic CSS family
+// `quote` wraps multi-word family names in double-quotes to keep CSS happy.
+export function buildFontFamilyChain({ pdfFamily, matchedFontFamily, isKorean, kind = 'sans' }) {
+  const parts = [];
+  if (pdfFamily) parts.push(/[^A-Za-z0-9_-]/.test(pdfFamily) ? `"${pdfFamily}"` : pdfFamily);
+  if (matchedFontFamily && !parts.includes(matchedFontFamily)) parts.push(matchedFontFamily);
+  if (isKorean) parts.push(KOREAN_FALLBACK);
+  else parts.push(LATIN_FALLBACK);
+  parts.push(kind === 'serif' ? 'serif' : kind === 'mono' ? 'monospace' : 'sans-serif');
+  return parts.join(', ');
+}

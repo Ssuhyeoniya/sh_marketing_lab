@@ -57,6 +57,17 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
     const baseX = tx[4];
     const baseY = tx[5];
     const angleDeg = (Math.atan2(tx[1], tx[0]) * 180) / Math.PI;
+    // Detect italic-style horizontal skew embedded in the text matrix:
+    // for a non-rotated, non-italic run tx[2] is (close to) 0. When the PDF
+    // applied a synthetic italic, tx[2] picks up a non-zero shear component.
+    // skewX is the angle (radians) we'd need to apply to recreate it.
+    const rotRad = Math.atan2(tx[1], tx[0]);
+    const xBasisLen = Math.hypot(tx[0], tx[1]) || 1;
+    const yBasisLen = Math.hypot(tx[2], tx[3]) || 1;
+    // Project the y-basis onto the rotated x-axis to isolate the shear.
+    const yProjOnX = (tx[2] * Math.cos(rotRad) + tx[3] * Math.sin(rotRad)) / xBasisLen;
+    const skewXRad = Math.abs(yProjOnX) > 0.02 ? Math.atan2(yProjOnX, yBasisLen) : 0;
+    const skewXDeg = (skewXRad * 180) / Math.PI;
     // pdfjs reports two height-related quantities:
     //   1. Math.hypot(tx[2], tx[3])   — derived from the text matrix, which
     //      can be inflated by font-size scaling tricks (e.g. Tf 1pt + Tm 12x).
@@ -67,16 +78,30 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
     // back to (1) only when pdfjs didn't supply a sensible height.
     const transformHeight = Math.hypot(tx[2], tx[3]);
     const itemHeight = Math.abs(it.height || 0) * canvasScale;
-    const fontSize = itemHeight > 2 ? itemHeight : transformHeight;
+    const fontSize = yBasisLen > 2 ? yBasisLen : (itemHeight > 2 ? itemHeight : transformHeight);
     if (!isFinite(fontSize) || fontSize < 1) continue;
     const wCanvas = (it.width || 0) * canvasScale;
-    const ascent = fontSize * 0.84;
-    const descent = fontSize * 0.16;
+    // pdfjs's styles map carries the FontDescriptor-derived data per font:
+    //   - fontFamily: the CSS family name pdfjs registered for the embedded
+    //     font via @font-face. Using this directly means the editor and the
+    //     canvas redraw will use the EXACT PDF font, byte-perfect.
+    //   - ascent / descent: typographic metrics from the FontDescriptor
+    //     (fractions of em). When supplied, use them instead of the 0.84/0.16
+    //     guess so the baseline lines up to the pixel.
+    const style = (tc.styles || {})[it.fontName] || null;
+    const pdfFamily = style?.fontFamily || '';
+    const fdAscent = typeof style?.ascent === 'number' ? style.ascent : null;
+    const fdDescent = typeof style?.descent === 'number' ? Math.abs(style.descent) : null;
+    const ascent = fdAscent != null ? fontSize * fdAscent : fontSize * 0.84;
+    const descent = fdDescent != null ? fontSize * fdDescent : fontSize * 0.16;
     items.push({
       text: it.str,
       fontName: it.fontName || '',
+      pdfFamily,             // pdfjs-registered CSS family for the embedded font
+      fdAscent, fdDescent,   // raw FontDescriptor metrics (em-fractions)
       fontSize,
       angleDeg,
+      skewXDeg,              // synthetic italic shear from the text matrix
       x: baseX,
       y: baseY - ascent,
       baseY,
