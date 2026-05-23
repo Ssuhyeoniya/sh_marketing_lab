@@ -311,7 +311,18 @@ export default function TextEdit() {
     // mode in the canvas toolbar — that mode estimates the clicked-word
     // boundary inside the line and pre-selects it in the input. This avoids
     // over-fragmenting the document into one-frame-per-word.
-    const lines = data.lines || [];
+    const rawLines = data.lines || [];
+    // Tesseract groups everything on the same baseline into one "line", which
+    // for tables means a whole row (multiple cells separated by the vertical
+    // rule) collapses into ONE line with massive whitespace gaps. Re-split
+    // each Tesseract line by clustering its words on x-gap: anywhere the gap
+    // between consecutive words is bigger than ~4× the line's typical word
+    // gap (or > 1.5× line height) is treated as a cell boundary.
+    const lines = [];
+    for (const rawLine of rawLines) {
+      const cellsInLine = splitOcrLineByCells(rawLine);
+      for (const cl of cellsInLine) lines.push(cl);
+    }
     const layers = [];
     for (const line of lines) {
       const rawText = (line.text || '').trim();
@@ -797,6 +808,64 @@ function synthWords(text, x, y, w, h) {
     cursor += part.length;
   }
   return out;
+}
+
+// Re-split a Tesseract line into per-cell pseudo-lines. Tesseract groups
+// every word with a similar baseline into the SAME line, so a table row
+// containing several cells comes back as one line whose `words` array holds
+// the union — separated by huge x-gaps where the vertical column rules
+// would have been. We cluster those words on x-gap to recover the cells.
+//
+// Threshold = max(4 × median word gap, 1.5 × line height). The median-gap
+// term scales with the row's natural inter-word spacing; the line-height
+// term gives a sensible floor for lines with only 2-3 words (where a
+// median is meaningless).
+function splitOcrLineByCells(line) {
+  const words = ((line.words) || []).filter((w) => w && w.bbox && w.text && w.text.trim());
+  if (words.length <= 1) return [line];
+
+  words.sort((a, b) => a.bbox.x0 - b.bbox.x0);
+
+  const gaps = [];
+  for (let i = 1; i < words.length; i++) {
+    gaps.push(words[i].bbox.x0 - words[i - 1].bbox.x1);
+  }
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] || 0;
+  const lineHeight = Math.max(1, line.bbox.y1 - line.bbox.y0);
+  const threshold = Math.max(4 * Math.max(median, 1), lineHeight * 1.5);
+
+  const cells = [[words[0]]];
+  for (let i = 1; i < words.length; i++) {
+    const gap = words[i].bbox.x0 - words[i - 1].bbox.x1;
+    if (gap > threshold) {
+      cells.push([words[i]]);
+    } else {
+      cells[cells.length - 1].push(words[i]);
+    }
+  }
+  if (cells.length === 1) return [line]; // no cell boundaries found
+
+  return cells.map((cellWords) => {
+    const x0 = Math.min(...cellWords.map((w) => w.bbox.x0));
+    const y0 = Math.min(...cellWords.map((w) => w.bbox.y0));
+    const x1 = Math.max(...cellWords.map((w) => w.bbox.x1));
+    const y1 = Math.max(...cellWords.map((w) => w.bbox.y1));
+    return {
+      text: cellWords.map((w) => w.text).join(' '),
+      bbox: { x0, y0, x1, y1 },
+      confidence: line.confidence,
+      words: cellWords,
+      // Preserve Tesseract's font_size if present so guessFont uses the
+      // line-level metric rather than re-deriving from the smaller cell
+      // bbox height (which could underestimate for short cell text).
+      font_size: line.font_size,
+      is_bold: line.is_bold,
+      is_italic: line.is_italic,
+      is_serif: line.is_serif,
+      is_monospace: line.is_monospace,
+    };
+  });
 }
 
 // Paint all per-page mutations onto an already-base-rendered canvas. Ordering:
