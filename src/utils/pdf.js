@@ -134,6 +134,14 @@ export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
 // pipe. Used both to detect cell boundaries inside a combined pdfjs item AND
 // to strip residual border glyphs from the final text.
 const BORDER_CHARS = /[─-╿\|｜]/g;
+// Cell-gap splitter. Splits an over-merged pdfjs text item on:
+//   - long whitespace runs (2+ spaces) — the canonical cell-padding signature
+//   - ASCII pipe / fullwidth pipe / Unicode box-drawing chars when pdfjs
+//     returned a cell border as a glyph alongside the cell text
+// Slash-as-separator is NOT included here — many product strings legitimately
+// embed "/" inside content (e.g. "원두 / 택배출고"). Splitting on it would
+// over-fragment those phrases. Cell boundaries get caught by the whitespace
+// run rule because pdfjs emits cell-padding as ≥ 2 spaces.
 const BORDER_GAP = /[─-╿\|｜]+|\s{2,}/g; // splitter pattern
 
 // Does the string contain any actual text content (letter, digit, hangul)?

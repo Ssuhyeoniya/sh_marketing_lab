@@ -144,8 +144,21 @@ export function looksGarbledKorean(s) {
   const text = String(s);
   const hangulMatches = text.match(/[가-힣]/g);
   if (!hangulMatches || hangulMatches.length === 0) return false;
+  // Recognised acronyms / units that legitimately appear mid-Korean — these
+  // are NOT garble signals when they show up as short uppercase Latin tokens.
+  const ALLOWED_UPPER = new Set([
+    'AI', 'AR', 'VR', 'IT', 'OS', 'PC', 'TV', 'PD', 'CD', 'DVD', 'USB',
+    'HD', 'FHD', 'UHD', '4K', '8K', 'OK', 'KO', 'EN', 'KR', 'US', 'EU',
+    'PDF', 'JPG', 'PNG', 'GIF', 'CEO', 'CTO', 'CFO', 'CMO', 'API', 'SDK',
+    'SUV', 'GPS', 'LED', 'LCD', 'OLED', 'IOS', 'IOT', 'SSD', 'HDD', 'CPU',
+    'GPU', 'RAM', 'ROM', 'MP3', 'MP4', 'KBS', 'MBC', 'SBS', 'YTN', 'JTBC',
+    'NASA', 'NATO', 'IMF', 'UN', 'UNDP', 'WHO', 'CCTV', 'KTX', 'SRT',
+    'BTS', 'SK', 'LG', 'KT', 'GS', 'CJ', 'SM', 'YG', 'JYP', 'EXO',
+    'BMW', 'KIA', 'EV', 'NFC',
+  ]);
   // 1) Latin-token capitalisation check (catches pdfjs glyph-name fallbacks).
   const tokens = text.split(/[\s,.()[\]{}<>"'/\\:;!?·•|\-_]+/);
+  let upperTokensInKorean = 0;
   for (const t of tokens) {
     if (!t || t.length < 2) continue;
     if (!/^[A-Za-z]+$/.test(t)) continue;
@@ -153,6 +166,17 @@ export function looksGarbledKorean(s) {
     const isAllUpper   = /^[A-Z]+$/.test(t);
     const isCamelCase  = /^[a-z]+(?:[A-Z][a-z]+)+$/.test(t);
     const isPascalCase = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/.test(t);
+    // Short uppercase tokens (2-4 chars) embedded mid-Korean are a classic
+    // garble pattern — pdfjs's PUA fallback decodes a CJK glyph as a 3-4
+    // letter all-caps "name". Allow only recognised acronyms.
+    if (isAllUpper && t.length >= 2 && t.length <= 4 && !ALLOWED_UPPER.has(t)) {
+      upperTokensInKorean++;
+      // Two or more unknown uppercase tokens = almost certainly garbled.
+      if (upperTokensInKorean >= 2) return true;
+      // Even a single unknown short uppercase token, when the Korean
+      // proportion is high, is a strong signal.
+      if (hangulMatches.length >= 3) return true;
+    }
     if (isAllLower || isAllUpper || isCamelCase || isPascalCase) continue;
     return true;
   }
@@ -199,10 +223,12 @@ export function assessPdfTextQuality(items) {
   }
   const ratio = total ? garbled / total : 0;
   return {
-    // Aggressively bail on suspect PDFs: even 8 % garbled items means a
-    // meaningful chunk of the page is unreadable in the editor. OCR
-    // fallback is cheap relative to showing nonsense in the editable layer.
-    trusted: ratio < 0.08,
+    // Aggressively bail on suspect PDFs: even a small fraction of garbled
+    // items means a meaningful chunk of the page is unreadable in the
+    // editor — and worse, the garble usually concentrates in the most
+    // editable text (body / table cells). OCR fallback is cheap relative
+    // to showing nonsense layers like "ATE 2개월 단위 EES 됩니다".
+    trusted: ratio < 0.05,
     garbledCount: garbled,
     total,
     ratio,
