@@ -314,13 +314,33 @@ export default function TextEdit() {
     const lines = data.lines || [];
     const layers = [];
     for (const line of lines) {
-      const text = (line.text || '').trim();
+      const rawText = (line.text || '').trim();
+      if (!rawText) continue;
+      // Strip OCR-induced border / box-drawing artefacts BEFORE the meaningful-
+      // content test, otherwise a line like "│ A │" passes the letter check on
+      // its lone "A" but still carries the bars into the final layer.
+      const text = rawText.replace(/[─-╿\|｜]+/g, ' ').replace(/\s+/g, ' ').trim();
       if (!text) continue;
-      if ((line.confidence ?? 100) < 30) continue;
+      // Confidence floor bumped to 55 — the previous 30 let through the
+      // garbage you saw at the top of the page (stylised logo glyphs OCR'd
+      // into "A 저 서" / "CFFEE 놀부"). 55 still keeps decent body text and
+      // drops the unrecoverable junk.
+      if ((line.confidence ?? 100) < 55) continue;
+      // Must contain real text content — same hasTextContent rule used on the
+      // PDF path.
       if (!/[a-zA-Z0-9가-힣]/.test(text)) continue;
+      // Drop "single weird char" results that come from OCR misreading lone
+      // glyphs / cell rulers (e.g. "A", "I", ":", "·"). Real text in this
+      // document is always ≥ 2 meaningful characters.
+      const meaningful = (text.match(/[a-zA-Z0-9가-힣]/g) || []).length;
+      if (meaningful < 2 && text.length < 3) continue;
       const lbw = line.bbox.x1 - line.bbox.x0;
       const lbh = line.bbox.y1 - line.bbox.y0;
       if (lbw < 6 || lbh < 6) continue;
+      // Suspiciously wide-aspect single-token results are usually a thin
+      // horizontal rule that survived suppression and got OCR'd into one
+      // stretched character. Drop them.
+      if (lbw / lbh > 25 && meaningful < 4) continue;
 
       const g = guessFont(line, page.canvas);
       const bg = sampleBg(page.canvas, line.bbox);
