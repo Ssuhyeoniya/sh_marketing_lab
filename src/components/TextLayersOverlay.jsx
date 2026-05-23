@@ -346,8 +346,13 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
               // sit exactly above the canvas glyphs underneath.
               left: PAD,
               top: PAD + baselineNudge,
-              width: 'auto',
-              minWidth: '100%',
+              // Fixed width = the box width. Without this the input had
+              // `width: auto + minWidth: 100%` and would balloon past the
+              // cell while typing, overlapping (and visually destroying)
+              // adjacent cells. The bbox-auto-resize on text change in
+              // TextEdit.update() grows w as the user types, so the input
+              // grows in lockstep — never past the layer's own bbox.
+              width: `calc(100% - ${PAD * 2}px)`,
               height: `${lineH}px`,
               whiteSpace: 'nowrap',
               border: 'none',
@@ -358,8 +363,6 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
               lineHeight: `${lineH}px`,
               fontFamily: l.fontFamily,
               fontWeight: l.fontWeight,
-              // Preserve the PDF's letter-spacing (Tc) and synthetic italic
-              // skew so the inline editor matches the canvas output exactly.
               letterSpacing: l.letterSpacing ? `${l.letterSpacing * scale}px` : 0,
               padding: 0,
               margin: 0,

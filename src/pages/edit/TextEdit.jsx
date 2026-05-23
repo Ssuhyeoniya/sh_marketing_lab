@@ -107,23 +107,38 @@ export default function TextEdit() {
     }
   }, [selectedLayerId]);
 
-  // Global keyboard shortcuts: Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y.
+  // Global keyboard shortcuts: Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y, Ctrl/Cmd+B.
   useEffect(() => {
     const onKey = (e) => {
-      // Confirm dialog owns Enter/Esc keys while open — don't run undo/redo.
       if (confirmState) return;
       const target = e.target;
-      // Don't hijack typing inside the inline text editor.
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+      // Don't hijack typing inside the inline text editor for plain typing,
+      // but DO handle Ctrl+B even when an input is focused so users can
+      // bold mid-edit (matches every word processor's behaviour).
+      const inEditor = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
       const meta = e.ctrlKey || e.metaKey;
       if (!meta) return;
       const key = e.key.toLowerCase();
+      if (key === 'b') {
+        // Bold toggle requires a selected layer.
+        if (!selectedLayerId) return;
+        e.preventDefault();
+        const layer = current?.layers.find((l) => l.id === selectedLayerId);
+        if (!layer) return;
+        pushHistory();
+        update(selectedLayerId, {
+          isBold: !layer.isBold,
+          fontWeight: !layer.isBold ? 700 : 400,
+        });
+        return;
+      }
+      if (inEditor) return;
       if (key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
       else if ((key === 'z' && e.shiftKey) || key === 'y') { e.preventDefault(); redo(); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [pages, confirmState]);
+  }, [pages, confirmState, selectedLayerId, current]);
 
   // Track canvas display size for overlay coord conversion.
   useEffect(() => {
@@ -506,15 +521,25 @@ export default function TextEdit() {
               layers: p.layers.map((l) => {
                 if (l.id !== id) return l;
                 const next = { ...l, ...patch };
-                // Content edits (text/font/color) require web-font rendering.
-                // Pure position edits (x/y) reuse the original glyph bitmap so
-                // the typography metric is preserved 1:1.
                 const EDIT_KEYS = ['text', 'fontFamily', 'fontName', 'fontWeight', 'fontSize', 'color', 'bgColor', 'w', 'h', 'isBold', 'isItalic', 'letterSpacing', 'skewXDeg', 'lineHeight', 'textAlign'];
                 const MOVE_KEYS = ['x', 'y'];
                 if (EDIT_KEYS.some((k) => patch[k] !== undefined)) next.edited = true;
                 if (MOVE_KEYS.some((k) => patch[k] !== undefined)) next.moved = true;
                 if ('color' in patch) next.colorEdited = true;
                 if ('bgColor' in patch) next.bgColorEdited = true;
+                // Auto-resize the bbox WIDTH whenever any property that
+                // affects rendered glyph width changes (text/font/size/
+                // weight/letter-spacing). Without this the inline editor's
+                // input was locked at the original cell width and longer
+                // edits got visually clipped. We measure with the SAME font
+                // string the canvas will use so the editor box and the
+                // canvas redraw stay in sync. originalW stays unchanged so
+                // the erase math still wipes the original glyph footprint.
+                if (patch.text !== undefined || patch.fontSize !== undefined
+                    || patch.fontFamily !== undefined || patch.fontWeight !== undefined
+                    || patch.letterSpacing !== undefined) {
+                  next.w = measureLayerWidth(next);
+                }
                 return next;
               }),
             }
@@ -811,6 +836,31 @@ export default function TextEdit() {
 function stripExt(s) { return (s || '').replace(/\.[^.]+$/, ''); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+let _layerMeasureCtx = null;
+// Measure the rendered glyph width of a layer using its actual font, size and
+// weight — same string the canvas will use when drawTextOverlay redraws.
+// Returns canvas-px width with a small breathing pad. Layer width is updated
+// in update() so the bbox grows / shrinks with text changes in real time.
+function measureLayerWidth(l) {
+  if (typeof document === 'undefined') return l.w;
+  if (!_layerMeasureCtx) _layerMeasureCtx = document.createElement('canvas').getContext('2d');
+  const ctx = _layerMeasureCtx;
+  const size = Math.max(4, +l.fontSize || 14);
+  const weight = +l.fontWeight || 400;
+  ctx.font = `${weight} ${size}px ${l.fontFamily || 'sans-serif'}`;
+  if (l.letterSpacing) {
+    try { ctx.letterSpacing = `${l.letterSpacing}px`; } catch {}
+  } else {
+    try { ctx.letterSpacing = '0px'; } catch {}
+  }
+  const measured = ctx.measureText(l.text || ' ').width;
+  // Tc fallback for browsers without ctx.letterSpacing support.
+  const lsFallback = (l.letterSpacing && !('letterSpacing' in ctx))
+    ? l.letterSpacing * Math.max(0, (l.text || '').length - 1)
+    : 0;
+  return Math.max(20, Math.ceil(measured + lsFallback + 6));
+}
+
 // Per-word bbox synthesis with uniform char-width. Powers 단어 수정 mode
 // for PDF-source layers (OCR layers get real per-word bboxes from
 // Tesseract's line.words array). Imperfect for proportional fonts but
@@ -1016,6 +1066,23 @@ function drawTextOverlay(ctx, l) {
   const fontSize = Math.max(4, Math.min(400, +l.fontSize || 14));
   const weight = +l.fontWeight || 400;
   ctx.save();
+  // Clip the redraw to the union of the layer's ORIGINAL footprint and its
+  // CURRENT bbox (with a few px of margin). This keeps an edited cell from
+  // spilling into adjacent cells — which is what made the table visually
+  // collapse in the screenshots. Layer bbox auto-grows as the user types
+  // (update() recomputes w from measureText), so the clip grows with it.
+  {
+    const PADC = 2;
+    const cox = l.originalX ?? l.x, coy = l.originalY ?? l.y;
+    const cow = l.originalW ?? l.w, coh = l.originalH ?? l.h;
+    const cx = Math.min(cox, l.x) - PADC;
+    const cy = Math.min(coy, l.y) - PADC;
+    const cw = Math.max(cox + cow, l.x + l.w) - cx + PADC;
+    const ch = Math.max(coy + coh, l.y + l.h) - cy + PADC;
+    ctx.beginPath();
+    ctx.rect(cx, cy, cw, ch);
+    ctx.clip();
+  }
   ctx.font = `${weight} ${fontSize}px ${l.fontFamily}`;
   ctx.textBaseline = 'alphabetic';
   // Letter-spacing preservation: apply the layer's reconstructed Tc so glyph
