@@ -460,7 +460,27 @@ export default function TextEdit() {
       // Then run sentence-merge on the survivors so fragments split by
       // pdfjs's tokeniser (one per font, kerning gap, operator boundary)
       // collapse into one editable phrase.
-      const mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
+      let mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
+      // ── Issue #26 A · final safety net ───────────────────────────────────
+      // Drop garble that survived per-item filtering AND merging. Reasons
+      // this catches more than the upstream filter:
+      //   • Merging can reintroduce garble by concatenating two clean
+      //     fragments whose joined form trips looksGarbledKorean.
+      //   • Some garbled items pass per-string check because the string
+      //     ALONE looks OK in isolation, but on a Korean-dominant page the
+      //     same content is clearly bogus (the standalone-Latin rule).
+      // This pass uses the same predicates as the upstream filter but on
+      // the FINAL layer text — so any path that produced a garbled layer
+      // gets cleaned up here.
+      if (_isKoreanPage) {
+        mergedLayers = mergedLayers.filter((l) => {
+          const t = (l.text || '').trim();
+          if (!t) return false;
+          if (looksGarbledKorean(t)) return false;
+          if (_isStandaloneGarble(t)) return false;
+          return true;
+        });
+      }
       onProg?.({ progress: 0.95, stage: '레이어 적용 중' });
       await sleep(40);
       setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers: mergedLayers, ocrDone: true } : p)));
@@ -1038,6 +1058,20 @@ export default function TextEdit() {
                 · {modeHint(editMode)}
               </span>
             )}
+            {/* Build badge — shows the commit SHA the deployed bundle was
+                built from. Lets the user verify they're running the latest
+                code (vs. a cached old bundle). Falls back to "dev" when
+                running via vite dev / when the env var isn't injected. */}
+            <span
+              style={{
+                marginLeft: 10, fontSize: 10, fontWeight: 500,
+                color: 'var(--text-muted)', fontFamily: 'monospace',
+                background: '#f3f4f6', padding: '2px 6px', borderRadius: 3,
+              }}
+              title={`Branch: ${import.meta.env.VITE_BRANCH || 'local'}`}
+            >
+              build:{(import.meta.env.VITE_COMMIT_SHA || 'dev').slice(0, 7)}
+            </span>
           </div>
           {current?.ocrDone && (
             <div className="edit-mode-bar" role="tablist">
