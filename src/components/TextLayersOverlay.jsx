@@ -336,7 +336,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
               padding: 0,
               margin: 0,
               boxSizing: 'border-box',
-              textAlign: 'left',
+              textAlign: l.textAlign || 'left',
               transform: [
                 l.angleDeg ? `rotate(${l.angleDeg}deg)` : '',
                 l.skewXDeg ? `skewX(${-l.skewXDeg}deg)` : '',
