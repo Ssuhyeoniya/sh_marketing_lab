@@ -269,15 +269,19 @@ export function guessFont(word, imageCanvas) {
       if (rowStrokes.length > 4) {
         const stroke = median(rowStrokes);
         const ratio = stroke / h;
-        // Empirical thresholds — calibrated against Pretendard / Noto Sans KR /
-        // Helvetica at common sizes:
-        //   regular: ratio ≈ 0.06–0.10
-        //   semi   : ratio ≈ 0.11–0.14
-        //   bold   : ratio ≈ 0.15–0.22
-        const boldThreshold = isKorean ? 0.155 : 0.130;
-        if (ratio > boldThreshold) { isBold = true; boldConfidence = Math.min(1, (ratio - boldThreshold) * 8); }
-        // Hoist stroke ratio so findFont can use it for thin/thick font
-        // selection (SUIT for thin, Black Han Sans for ultra-thick).
+        // Empirical thresholds calibrated against real renderings:
+        //   regular  : ratio ≈ 0.06–0.10
+        //   medium   : ratio ≈ 0.11–0.13
+        //   bold     : ratio ≈ 0.13–0.20
+        //   black    : ratio ≈ 0.20+
+        // Lowered from 0.155/0.130 → 0.130/0.110 so titles like "식권대장
+        // 인바운드 인입 분석" — which sit right at the bold/medium border —
+        // are reliably picked up as bold.
+        const boldThreshold = isKorean ? 0.130 : 0.110;
+        if (ratio > boldThreshold) {
+          isBold = true;
+          boldConfidence = Math.min(1, (ratio - boldThreshold) * 8);
+        }
         strokeRatio = ratio;
       }
     } catch {}
@@ -285,8 +289,13 @@ export function guessFont(word, imageCanvas) {
 
   const kind = isMono ? 'mono' : isSerif ? 'serif' : 'sans';
   const script = isKorean ? 'ko' : 'lat';
-  const weight = isBold ? 700 : 400;
-  // Width/height for display heuristics.
+  // Three-tier weight: regular → bold → ultra-bold (Black). Very thick
+  // strokes (Black Han Sans / Noto Sans KR Black territory) get weight 900
+  // so the canvas renders them with the right CSS face.
+  let weight;
+  if (strokeRatio > 0.20)      weight = 900;
+  else if (isBold)             weight = 700;
+  else                         weight = 400;
   const fontSizePx = height;
   // tieKey makes successive layers with identical metrics map to DIFFERENT
   // fonts (round-robin among tied candidates) instead of all landing on
@@ -368,20 +377,41 @@ const PDF_FONT_ALIASES = {
 //      the original glyph width, so Korean glyphs don't reflow on edit.
 export function matchPdfFont(fontName, text, style, opts = {}) {
   const raw = String(fontName || '').replace(/^[A-Z]{6}\+/, '');
+  // Two normalised forms: with and without hyphens, so font names like
+  //   "Pretendard-Bold" / "PretendardBold" / "pretendard_bold"
+  // all collapse to the same lookup keys.
   const lower = raw.toLowerCase().replace(/[\s_]/g, '');
+  const lowerNoDash = lower.replace(/-/g, '');
   const styleFamily = (style?.fontFamily || '').toLowerCase();
   const combined = `${lower} ${styleFamily}`;
+  // Bold signal pulled out early so the alias lookup can upgrade a Regular
+  // hit to the Bold sibling when the PDF font name flagged bold.
+  const nameHasBold = /bold|black|heavy|semibold|demi/.test(combined);
 
-  // 1) Direct alias hit?
-  if (PDF_FONT_ALIASES[lower]) {
-    const hit = SYSTEM_FONTS.find((f) => f.name === PDF_FONT_ALIASES[lower]);
-    if (hit) return { font: hit, weight: hit.weight };
+  // Helper: when an alias lookup landed on a Regular face but the font name
+  // also signals bold, upgrade to the same family's Bold variant.
+  const upgradeBold = (hit) => {
+    if (!hit || !nameHasBold) return hit;
+    if (/bold|black|heavy/i.test(hit.name)) return hit; // already bold
+    const bolder = SYSTEM_FONTS.find((f) =>
+      f.family === hit.family && /bold|black|heavy/i.test(f.name)
+    );
+    return bolder || hit;
+  };
+
+  // 1) Direct alias hit (with or without dashes).
+  let hit = SYSTEM_FONTS.find((f) => f.name === (PDF_FONT_ALIASES[lower] || PDF_FONT_ALIASES[lowerNoDash]));
+  if (hit) {
+    hit = upgradeBold(hit);
+    return { font: hit, weight: hit.weight };
   }
-  // Try prefix matches for hyphenated variants we didn't enumerate.
-  const aliasKey = Object.keys(PDF_FONT_ALIASES).find((k) => lower.startsWith(k));
+  // 2) Prefix-match (sort longest first so "pretendard-bold" beats "pretendard").
+  const sortedKeys = Object.keys(PDF_FONT_ALIASES).sort((a, b) => b.length - a.length);
+  const aliasKey = sortedKeys.find((k) => lower.startsWith(k) || lowerNoDash.startsWith(k.replace(/-/g, '')));
   if (aliasKey) {
-    const hit = SYSTEM_FONTS.find((f) => f.name === PDF_FONT_ALIASES[aliasKey]);
-    if (hit) return { font: hit, weight: hit.weight };
+    let h = SYSTEM_FONTS.find((f) => f.name === PDF_FONT_ALIASES[aliasKey]);
+    h = upgradeBold(h);
+    if (h) return { font: h, weight: h.weight };
   }
 
   // 2) Heuristic scoring on traits.
@@ -443,6 +473,11 @@ function getMeasureCtx() {
 
 // System Korean fonts that ship with the OS — used as a guaranteed-glyph
 // fallback so Korean text never falls through to a Latin-only system sans.
+// Korean OS fallbacks. The CSS font-weight on the element selects the
+// matching face (Apple SD Gothic Neo, Malgun Gothic, etc. all ship with
+// multiple weights), so a layer with font-weight: 700 will render in the
+// bold cut of whichever face is present locally — no need for separate
+// "Malgun Gothic Bold" family names.
 export const KOREAN_FALLBACK = '"Apple SD Gothic Neo", "Malgun Gothic", "맑은 고딕", "Nanum Gothic", "Noto Sans KR"';
 export const LATIN_FALLBACK = '"Helvetica Neue", Helvetica, Arial';
 

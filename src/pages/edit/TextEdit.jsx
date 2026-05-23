@@ -314,19 +314,34 @@ export default function TextEdit() {
 
     // Fallback: rasterized OCR for scans / image-only PDFs / images.
     onProg?.({ stage: 'Tesseract OCR 인식 중' });
-    // Line-suppressed copy of the page canvas — table borders masked out so
-    // text crossing or hugging a rule doesn't get clipped by Tesseract. The
-    // original canvas is preserved for colour sampling and final rendering.
     const ocrInput = suppressTableLines(page.canvas);
     const data = await recognizeImage(ocrInput, onProg);
 
-    // Sentence-level grouping: one layer per LINE. Tesseract gives `lines`
-    // already at sentence/visual-line granularity, which is what the user
-    // edits as a unit. Word-level access is still available via the "단어 수정"
-    // mode in the canvas toolbar — that mode estimates the clicked-word
-    // boundary inside the line and pre-selects it in the input. This avoids
-    // over-fragmenting the document into one-frame-per-word.
     const rawLines = data.lines || [];
+
+    // Sanity cap derived from the WHOLE-PAGE distribution of word heights.
+    // Tesseract occasionally reports a single word with a bbox 3-5× the real
+    // glyph height — when that happens the layer ends up with fontSize 100+
+    // for what should be 25 px body text, the inline editor balloons, and
+    // the rendered glyphs appear at the wrong scale. Computing the median
+    // height once gives us a robust per-page baseline; anything dramatically
+    // larger than the body-text median is rejected or capped.
+    const allWordHeights = rawLines
+      .flatMap((ln) => (ln.words || []))
+      .map((w) => (w?.bbox?.y1 ?? 0) - (w?.bbox?.y0 ?? 0))
+      .filter((h) => h > 4)
+      .sort((a, b) => a - b);
+    const docMedianH = allWordHeights.length
+      ? allWordHeights[Math.floor(allWordHeights.length / 2)]
+      : 0;
+    // Layers taller than this are almost always misdetected (e.g. an OCR
+    // bbox that swallowed multiple rows because a vertical rule wasn't
+    // suppressed). Skip them entirely.
+    const heightSkipPx = docMedianH ? docMedianH * 2.5 : Infinity;
+    // Cap any individual layer's fontSize at this many px regardless of what
+    // word-height analysis returns. Generous (1.8×) so genuinely tall
+    // headlines on the same page still render — but not 5× tall.
+    const fontSizeCapPx = docMedianH ? docMedianH * 1.8 : Infinity;
     // Two-pass cell splitting:
     //   (1) splitOcrLineByRows  — Tesseract with PSM 6 merges vertically
     //       adjacent text in the same column into ONE line (a multi-line cell
@@ -370,8 +385,12 @@ export default function TextEdit() {
       const lbw = line.bbox.x1 - line.bbox.x0;
       const lbh = line.bbox.y1 - line.bbox.y0;
       if (lbw < 6 || lbh < 6) continue;
-      // Suspiciously wide-aspect single-token results are usually a thin
-      // horizontal rule that survived suppression and got OCR'd into one
+      // Page-relative sanity check: drop lines whose bbox is dramatically
+      // taller than the median word height across the entire page. These
+      // are misdetected OCR bboxes (one word reported with a 100+ px height
+      // even though the actual glyph is 25 px) that would otherwise produce
+      // a layer with absurd fontSize and a column-spanning visible box.
+      if (lbh > heightSkipPx) continue;
       // stretched character. Drop them.
       if (lbw / lbh > 25 && meaningful < 4) continue;
       // Image-as-text filter: a single-word cell with very few
@@ -399,6 +418,14 @@ export default function TextEdit() {
         const isK = /[가-힣]/.test(text);
         g.size = Math.round(medianH * (isK ? 0.88 : 0.78));
       }
+      // Hard cap against the page-wide median. Anything wildly larger than
+      // the body text is almost certainly a Tesseract bbox mistake — clamp
+      // it so layer.fontSize stays in a sane range and the editor stops
+      // ballooning. Real titles are usually <1.8× body height; that's
+      // exactly fontSizeCapPx.
+      if (fontSizeCapPx !== Infinity && g.size > fontSizeCapPx) {
+        g.size = Math.round(fontSizeCapPx);
+      }
       const bg = sampleBg(page.canvas, line.bbox);
       const fg = sampleFg(page.canvas, line.bbox, bg);
       const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(text);
@@ -416,21 +443,31 @@ export default function TextEdit() {
         const delta = (lbw - native) / (text.length - 1);
         if (isFinite(delta) && Math.abs(delta) < g.size * 0.4) letterSpacing = delta;
       }
+      // Reconcile bbox height with fontSize. If Tesseract gave us a bbox
+      // taller than the glyphs (multi-row pollution caught above) we keep
+      // the bbox WIDTH and ANCHOR (x, y1=baseline) but shrink the height
+      // to fontSize × 1.15 — the actual ink envelope — anchored to the
+      // ORIGINAL baseline so glyphs stay visually pinned to where the OCR
+      // saw them. Without this the layer rect would still span multiple
+      // rows even after the fontSize cap.
+      const baseY = line.bbox.y1;
+      const effH = Math.min(lbh, Math.round(g.size * 1.15));
+      const effY = baseY - effH;
       layers.push({
         id: crypto.randomUUID(),
         text,
         originalText: text,
         x: line.bbox.x0,
-        y: line.bbox.y0,
+        y: effY,
         w: lbw,
-        h: lbh,
+        h: effH,
         originalX: line.bbox.x0,
-        originalY: line.bbox.y0,
+        originalY: effY,
         originalW: lbw,
-        originalH: lbh,
-        baseY: line.bbox.y1,
-        ascent: lbh * 0.82,
-        descent: lbh * 0.18,
+        originalH: effH,
+        baseY,
+        ascent: effH * 0.82,
+        descent: effH * 0.18,
         angleDeg: 0,
         skewXDeg: g.isItalic ? 10 : 0,
         letterSpacing,
@@ -539,6 +576,20 @@ export default function TextEdit() {
                     || patch.fontFamily !== undefined || patch.fontWeight !== undefined
                     || patch.letterSpacing !== undefined) {
                   next.w = measureLayerWidth(next);
+                }
+                // Auto-adjust container HEIGHT when fontSize changes — text
+                // container auto-height. Keep the baseline anchored so
+                // moving / re-rendering doesn't shift glyphs vertically.
+                // ascent / descent are recomputed from the new fontSize so
+                // descender padding stays correct after the resize.
+                if (patch.fontSize !== undefined) {
+                  const newH = Math.max(8, Math.round((+patch.fontSize || 14) * 1.15));
+                  const baseY = (next.baseY ?? (l.y + l.h));
+                  next.h = newH;
+                  next.y = baseY - newH * 0.82; // keep baseline visually fixed
+                  next.ascent = newH * 0.82;
+                  next.descent = newH * 0.18;
+                  next.lineHeight = +patch.fontSize;
                 }
                 return next;
               }),
@@ -854,11 +905,15 @@ function measureLayerWidth(l) {
     try { ctx.letterSpacing = '0px'; } catch {}
   }
   const measured = ctx.measureText(l.text || ' ').width;
-  // Tc fallback for browsers without ctx.letterSpacing support.
   const lsFallback = (l.letterSpacing && !('letterSpacing' in ctx))
     ? l.letterSpacing * Math.max(0, (l.text || '').length - 1)
     : 0;
-  return Math.max(20, Math.ceil(measured + lsFallback + 6));
+  // Right-side breathing room scaled with font size — measureText returns
+  // glyph ADVANCE width, but the actual ink can extend past it by a side-
+  // bearing fraction (worst case ~25 % of fontSize for bold display faces).
+  // Without enough margin the right-most glyph gets clipped after edit.
+  const trailPad = Math.max(8, Math.round(size * 0.25));
+  return Math.max(20, Math.ceil(measured + lsFallback + trailPad));
 }
 
 // Per-word bbox synthesis with uniform char-width. Powers 단어 수정 mode
@@ -1007,10 +1062,15 @@ function splitOcrLineByCells(line) {
 //   4. Paint user-drawn area-erase rectangles last so they always win.
 function renderEdits(ctx, p) {
   const src = p.canvas;
-  const PAD = 1;
   for (const l of p.layers) {
     const needsErase = l.deleted || l.edited || (l.moved && !l.deleted);
     if (!needsErase) continue;
+    // Pad the erase rect by 15 % of the font height (min 3 px). The previous
+    // 1 px was too tight for large headlines — antialiased glyph pixels
+    // bleeding ~2 px past the OCR bbox were left behind, which is what
+    // looked like ghost text under a moved layer.
+    const fz = +l.fontSize || 14;
+    const PAD = Math.max(3, Math.round(fz * 0.15));
     ctx.fillStyle = l.bgColor || '#ffffff';
     ctx.fillRect(
       (l.originalX ?? l.x) - PAD,
@@ -1067,12 +1127,13 @@ function drawTextOverlay(ctx, l) {
   const weight = +l.fontWeight || 400;
   ctx.save();
   // Clip the redraw to the union of the layer's ORIGINAL footprint and its
-  // CURRENT bbox (with a few px of margin). This keeps an edited cell from
-  // spilling into adjacent cells — which is what made the table visually
-  // collapse in the screenshots. Layer bbox auto-grows as the user types
-  // (update() recomputes w from measureText), so the clip grows with it.
+  // CURRENT bbox, with explicit padding for ascender/descender extent. The
+  // previous PADC=2 was too tight: for a 44 px headline the descender pixels
+  // of "권" / "양" sit ~3–4 px below the OCR bbox bottom, so they were
+  // sliced off by the clip on every redraw. fontSize-relative padding
+  // ensures the clip never bites into the rendered glyph footprint.
   {
-    const PADC = 2;
+    const PADC = Math.max(4, Math.round(fontSize * 0.20));
     const cox = l.originalX ?? l.x, coy = l.originalY ?? l.y;
     const cow = l.originalW ?? l.w, coh = l.originalH ?? l.h;
     const cx = Math.min(cox, l.x) - PADC;
