@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
-import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText } from '../../utils/ocr';
+import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText, preprocessForOcr, assessPdfTextQuality } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob, extractPageTextItems } from '../../utils/pdf';
 import { PDFDocument } from 'pdf-lib';
 import { useFontsReady } from '../../utils/fonts';
@@ -164,9 +164,29 @@ export default function TextEdit() {
           // Try to extract the native PDF text layer at the same scale as the
           // rendered canvas. For text-based PDFs this gives exact positioning,
           // font size and baseline — far more accurate than re-running OCR.
+          //
+          // BUT: many Korean PDFs subset their fonts and map glyphs to PUA
+          // codepoints without a usable ToUnicode CMap. pdfjs then returns
+          // garbled strings — visually the page renders correctly (the
+          // glyphs are there in the font), but `getTextContent()` decodes
+          // them as random Latin sequences ("원두는" → "ATE"). We can't
+          // edit text we can't read, so we run a quality check and discard
+          // the PDF text layer entirely when it looks corrupted; the page
+          // then falls through to the OCR pipeline below, which reads the
+          // RENDERED glyphs and produces correct strings.
           let pdfText = null;
           try {
             pdfText = await extractPageTextItems(pdf, i, 2);
+            if (pdfText && pdfText.items) {
+              const q = assessPdfTextQuality(pdfText.items);
+              if (!q.trusted) {
+                console.warn(
+                  `[TextEdit] Page ${i}: ${q.garbledCount}/${q.total} PDF text items look ` +
+                  `corrupted (${Math.round(q.ratio * 100)}%) — falling back to OCR for this page.`
+                );
+                pdfText = null;
+              }
+            }
           } catch {}
           out.push({
             id: crypto.randomUUID(),
@@ -374,9 +394,37 @@ export default function TextEdit() {
     }
 
     // Fallback: rasterized OCR for scans / image-only PDFs / images.
+    onProg?.({ stage: 'OCR 전처리 중' });
+    // Preprocess: 2× upscale low-DPI pages, sharpen anti-aliased edges,
+    // and snap row-local background noise to white so Tesseract's
+    // adaptive classifier doesn't get confused by JPEG ringing around
+    // small Korean glyphs. Then suppress in-cell ruling lines so cell
+    // borders don't get merged into adjacent glyphs.
+    const preProc  = preprocessForOcr(page.canvas);
+    const ocrInput = suppressTableLines(preProc);
     onProg?.({ stage: 'Tesseract OCR 인식 중' });
-    const ocrInput = suppressTableLines(page.canvas);
     const data = await recognizeImage(ocrInput, onProg);
+
+    // Tesseract bboxes returned in `ocrInput` pixel space — when the
+    // preprocessor scaled the canvas 2× we need to map coords back down
+    // to the ORIGINAL page.canvas grid (which is what layer x/y/w/h
+    // reference for erase, bitmap-lift, and the overlay). One scale
+    // factor handles both axes (we never anisotropic-scale).
+    const ocrScale = preProc.width / page.canvas.width;
+    if (ocrScale !== 1 && data.lines) {
+      for (const ln of data.lines) {
+        if (ln.bbox) {
+          ln.bbox.x0 /= ocrScale; ln.bbox.x1 /= ocrScale;
+          ln.bbox.y0 /= ocrScale; ln.bbox.y1 /= ocrScale;
+        }
+        for (const w of (ln.words || [])) {
+          if (w.bbox) {
+            w.bbox.x0 /= ocrScale; w.bbox.x1 /= ocrScale;
+            w.bbox.y0 /= ocrScale; w.bbox.y1 /= ocrScale;
+          }
+        }
+      }
+    }
 
     const rawLines = data.lines || [];
 
