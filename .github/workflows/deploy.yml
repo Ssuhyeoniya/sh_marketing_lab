@@ -30,7 +30,11 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build
+      - name: Build
+        env:
+          VITE_COMMIT_SHA: ${{ github.sha }}
+          VITE_BRANCH: ${{ github.ref_name }}
+        run: npm run build
 
       - name: Copy index.html to 404.html (SPA fallback)
         run: cp dist/index.html dist/404.html
