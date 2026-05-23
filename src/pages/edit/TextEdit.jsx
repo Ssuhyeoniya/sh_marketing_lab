@@ -249,17 +249,14 @@ export default function TextEdit() {
               letterSpacing = delta;
             }
           }
-          // Frame padding for clickability — keep originalX/Y/W/H tight so
-          // glyph erase / lift / baseline math run against the actual ink.
-          const PAD = 3;
           return {
             id: crypto.randomUUID(),
             text: it.text,
             originalText: it.text,
-            x: it.x - PAD,
-            y: it.y - PAD,
-            w: it.w + PAD * 2,
-            h: it.h + PAD * 2,
+            x: it.x,
+            y: it.y,
+            w: it.w,
+            h: it.h,
             originalX: it.x,
             originalY: it.y,
             originalW: it.w,
@@ -311,7 +308,6 @@ export default function TextEdit() {
     // over-fragmenting the document into one-frame-per-word.
     const lines = data.lines || [];
     const layers = [];
-    const PAD = 3; // visual breathing room around the bbox
     for (const line of lines) {
       const text = (line.text || '').trim();
       if (!text) continue;
@@ -339,17 +335,14 @@ export default function TextEdit() {
         const delta = (lbw - native) / (text.length - 1);
         if (isFinite(delta) && Math.abs(delta) < g.size * 0.4) letterSpacing = delta;
       }
-      // Slight bbox expansion: gives the user breathing room when clicking
-      // tight cells. originalX/Y/W/H stays tight so glyph erase / lift
-      // happens against the actual ink footprint.
       layers.push({
         id: crypto.randomUUID(),
         text,
         originalText: text,
-        x: line.bbox.x0 - PAD,
-        y: line.bbox.y0 - PAD,
-        w: lbw + PAD * 2,
-        h: lbh + PAD * 2,
+        x: line.bbox.x0,
+        y: line.bbox.y0,
+        w: lbw,
+        h: lbh,
         originalX: line.bbox.x0,
         originalY: line.bbox.y0,
         originalW: lbw,
