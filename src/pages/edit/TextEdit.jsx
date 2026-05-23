@@ -1165,21 +1165,47 @@ function dedupOverlappingLayers(layers) {
       const bx2 = b.x + b.w, by2 = b.y + b.h;
       const ix0 = Math.max(a.x, b.x), iy0 = Math.max(a.y, b.y);
       const ix1 = Math.min(ax2, bx2), iy1 = Math.min(ay2, by2);
-      if (ix1 <= ix0 || iy1 <= iy0) continue;
-      const inter = (ix1 - ix0) * (iy1 - iy0);
+      const inter = (ix1 > ix0 && iy1 > iy0) ? (ix1 - ix0) * (iy1 - iy0) : 0;
       const aArea = Math.max(1, a.w * a.h);
       const bArea = Math.max(1, b.w * b.h);
       const overlap = inter / Math.min(aArea, bArea);
-      if (overlap < 0.6) continue;
-      // Pick the survivor.
-      // Lazy load looksGarbledKorean from the closure scope — already imported.
+
+      // Primary check: substantial area overlap. Lowered from 0.6 to 0.45 —
+      // pdfjs's invisible ActualText overlay frequently sits at a slightly
+      // different baseline than the visible-glyph item (the invisible layer
+      // uses the FONT'S OWN ascent/descent metrics while the visible layer
+      // sits where the glyph ink actually lives), so the bbox overlap stays
+      // below 60 % even though they refer to the same word.
+      let duplicate = overlap >= 0.45;
+
+      // Secondary check: baseline + horizontal-extent overlap. Two items
+      // that share the same baseline within 2 px AND whose X-ranges
+      // overlap by ≥ 70 % of the shorter run are almost always the
+      // visible-glyph + invisible-ActualText pair. Catches the case the
+      // area test misses when the invisible overlay has a slightly
+      // different y0 / y1.
+      if (!duplicate) {
+        const baseA = a.baseY ?? (a.y + a.h);
+        const baseB = b.baseY ?? (b.y + b.h);
+        const baselineMatch = Math.abs(baseA - baseB) <= 2;
+        const xOver = (ix1 > ix0) ? (ix1 - ix0) : 0;
+        const minWidth = Math.max(1, Math.min(a.w, b.w));
+        if (baselineMatch && xOver / minWidth >= 0.7) duplicate = true;
+      }
+
+      if (!duplicate) continue;
+
+      // Pick the survivor — prefer non-garbled, then longer, then bigger.
       const aGarbled = typeof looksGarbledKorean === 'function' && looksGarbledKorean(a.text);
       const bGarbled = typeof looksGarbledKorean === 'function' && looksGarbledKorean(b.text);
       let dropIdx;
       if (aGarbled && !bGarbled) dropIdx = i;
       else if (bGarbled && !aGarbled) dropIdx = j;
-      else if ((a.text || '').length >= (b.text || '').length) dropIdx = j;
-      else dropIdx = i;
+      else if ((a.text || '').length !== (b.text || '').length) {
+        dropIdx = (a.text || '').length >= (b.text || '').length ? j : i;
+      } else {
+        dropIdx = aArea >= bArea ? j : i;
+      }
       drop.add(dropIdx);
       if (dropIdx === i) break;     // 'a' is gone, restart with next i
     }
@@ -1247,6 +1273,16 @@ function canMerge(a, b) {
   const fz = Math.max(a.fontSize || 0, b.fontSize || 0, 1);
   if (Math.abs(baseA - baseB) > fz * 0.25) return false;
   if ((a.color || '') !== (b.color || '')) return false;
+  // Sentence-final guard. If `a` ends with sentence-terminal punctuation
+  // (".", "!", "?", "。", "다.", "요.") we don't extend it with the next
+  // fragment even if everything else lines up — it's a NEW sentence in the
+  // same line and the user wants to edit it independently.
+  const aText = (a.text || '').trim();
+  if (/[.!?。]$/.test(aText) || /(다|요)\.$/.test(aText)) return false;
+  // Parenthetical-label guard. "(VAT포함)" sitting next to a regular run
+  // should stay its own layer — the user wants per-label selection.
+  if (/^[(（[].+[)）\]]\s*$/.test((b.text || '').trim())) return false;
+  if (/^[(（[].+[)）\]]\s*$/.test(aText)) return false;
   // x-ordering: b must sit to the right of a, with a gap small enough to be
   // an in-sentence spacer. 1.2 em is roughly one full-width Korean glyph or
   // a wide Latin word-space — anything more and the two fragments belong to
@@ -1256,6 +1292,7 @@ function canMerge(a, b) {
   if (gap > fz * 1.2) return false;       // too far apart
   return true;
 }
+
 
 let _layerMeasureCtx = null;
 // Measure the rendered glyph width of a layer using its actual font, size and
@@ -1481,21 +1518,43 @@ function renderEdits(ctx, p) {
   for (const l of p.layers) {
     const needsErase = l.deleted || l.edited || (l.moved && !l.deleted);
     if (!needsErase) continue;
-    // Erase rect uses the PIXEL-TIGHT glyph extent (glyphTop / glyphBottom
-    // captured at OCR time) instead of the line-box. The line-box is
-    // anchored to fontSize so the editor input fits, but it can overhang
-    // adjacent rows in tightly-stacked tables — using the line-box for
-    // the erase pass made the wipe bleed into the next row. The tight
-    // rect covers exactly what was rendered.
+    // Erase rect = UNION of (original glyph footprint) ∪ (new draw extent)
+    // with generous padding. Previous versions used only the pixel-tight
+    // extent and stopped at `originalW` horizontally — that left two
+    // failure modes visible to the user:
+    //   1) When pdfjs returned a font whose glyph ink extended ABOVE the
+    //      reported tight box (PUA-mapped Korean glyphs render at the
+    //      font's true ascent, not the bbox we computed), an ascender
+    //      sliver remained over the new text.
+    //   2) When the user typed text WIDER than the original, the right
+    //      end of the OLD glyph wasn't fully wiped — for an OCR'd page
+    //      the original glyph extends to wordRight which may exceed
+    //      originalW after we re-tightened it; for a deletion-only flow
+    //      moving text away, the destination area lacks erase too.
+    // Using the FULL line-box (originalY..originalY+originalH) plus an
+    // em-scaled padding covers ascender ink reliably; unioning with the
+    // current rect handles the wider-edit case.
     const fz = +l.fontSize || 14;
-    const PAD_X = Math.max(3, Math.round(fz * 0.18)); // side-bearing slack
-    const PAD_Y = Math.max(2, Math.round(fz * 0.10)); // AA halo slack
+    const PAD_X = Math.max(4, Math.round(fz * 0.30));
+    const PAD_Y = Math.max(3, Math.round(fz * 0.25));
     const ox = (l.originalX ?? l.x);
+    const oy = (l.originalY ?? l.y);
     const ow = (l.originalW ?? l.w);
-    const top = (l.glyphTop != null ? l.glyphTop : (l.originalY ?? l.y));
-    const bot = (l.glyphBottom != null ? l.glyphBottom : ((l.originalY ?? l.y) + (l.originalH ?? l.h)));
+    const oh = (l.originalH ?? l.h);
+    // Vertical coverage: union of line-box and pixel-tight extent
+    // (whichever is taller) — covers PUA-tall ink AND prevents bleed
+    // into adjacent rows when the tight scan was accurate.
+    const topTight = (l.glyphTop != null ? l.glyphTop : oy);
+    const botTight = (l.glyphBottom != null ? l.glyphBottom : (oy + oh));
+    const eraseTop = Math.min(oy, topTight) - PAD_Y;
+    const eraseBot = Math.max(oy + oh, botTight) + PAD_Y;
+    // Horizontal coverage: union of original footprint and current rect
+    // (handles edited-wider-than-original and moved-then-edited cases).
+    const cx = l.x, cw = l.w;
+    const eraseLeft  = Math.min(ox, cx) - PAD_X;
+    const eraseRight = Math.max(ox + ow, cx + cw) + PAD_X;
     ctx.fillStyle = l.bgColor || '#ffffff';
-    ctx.fillRect(ox - PAD_X, top - PAD_Y, ow + PAD_X * 2, (bot - top) + PAD_Y * 2);
+    ctx.fillRect(eraseLeft, eraseTop, eraseRight - eraseLeft, eraseBot - eraseTop);
   }
   for (const l of p.layers) {
     if (l.deleted || l.edited || l.visible === false) continue;
@@ -1558,8 +1617,14 @@ function drawTextOverlay(ctx, l) {
   // the padding is what stops the redraw from CHOPPING off the bottom of
   // descenders ("g/p/y") or the right side of a bold glyph's overhang.
   {
-    const PADC_V = Math.max(6, Math.round(fontSize * 0.40));
-    const PADC_H = Math.max(6, Math.round(fontSize * 0.30));
+    // Clip = union(original-footprint, current-rect) + generous em-scaled
+    // padding. Padding has to be at least as large as the erase pass uses
+    // in `renderEdits` (PAD_X ≈ 0.30 em, PAD_Y ≈ 0.25 em) plus headroom
+    // for the actual fillText draw — bold faces and Korean glyphs paint
+    // a few px past the advance width / line-box. Bumped to 0.55 em
+    // vertical / 0.45 em horizontal so the new text never clips on edit.
+    const PADC_V = Math.max(8, Math.round(fontSize * 0.55));
+    const PADC_H = Math.max(8, Math.round(fontSize * 0.45));
     const cox = l.originalX ?? l.x, coy = l.originalY ?? l.y;
     const cow = l.originalW ?? l.w, coh = l.originalH ?? l.h;
     const cx = Math.min(cox, l.x) - PADC_H;
@@ -1600,21 +1665,17 @@ function drawTextOverlay(ctx, l) {
   const newTop = baseY - ascent;
   const newBottom = baseY + descent;
   const PAD = 1;
-  // Background is TRANSPARENT by default. Two cases need a fill:
-  //   1) ALWAYS erase the original-glyph footprint with the locally-sampled
-  //      page colour so the original ink doesn't show through behind the
-  //      edited / moved text. This uses `l.bgColor` (sampled at OCR time)
-  //      and is required regardless of user preference.
-  //   2) ONLY if the user explicitly chose a background colour for this
-  //      layer (`l.bgColorEdited`) do we paint a coloured rect behind the
-  //      new text position. Otherwise the new text overlays whatever's
-  //      already on the canvas — matching the user's request that
-  //      "글씨 배경은 무조건 기본값 투명".
+  // Background is TRANSPARENT by default. The erase of the ORIGINAL
+  // glyph footprint already happened in `renderEdits` (with a generous
+  // line-box + new-extent union + em-scaled padding), so we don't
+  // re-erase here — doing so with a smaller rect would actually be
+  // counterproductive (it could re-paint inside the already-erased zone
+  // and visually betray a slightly off-colour patch). The only fill we
+  // still need is when the user has EXPLICITLY chosen a coloured
+  // background for this layer.
   const eraseBg = l.bgColor || '#ffffff';
   const ox = l.originalX ?? l.x, oy = l.originalY ?? l.y;
   const ow = l.originalW ?? l.w, oh = l.originalH ?? l.h;
-  ctx.fillStyle = eraseBg;
-  ctx.fillRect(ox - PAD, oy - PAD, ow + PAD * 2, oh + PAD * 2);
   if (l.bgColorEdited && l.bgColor) {
     const newLeft = l.x - PAD;
     const newRight = l.x + Math.max(l.w, Math.ceil(newW)) + PAD;
