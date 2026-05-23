@@ -443,31 +443,42 @@ export default function TextEdit() {
         const delta = (lbw - native) / (text.length - 1);
         if (isFinite(delta) && Math.abs(delta) < g.size * 0.4) letterSpacing = delta;
       }
-      // Reconcile bbox height with fontSize. If Tesseract gave us a bbox
-      // taller than the glyphs (multi-row pollution caught above) we keep
-      // the bbox WIDTH and ANCHOR (x, y1=baseline) but shrink the height
-      // to fontSize × 1.15 — the actual ink envelope — anchored to the
-      // ORIGINAL baseline so glyphs stay visually pinned to where the OCR
-      // saw them. Without this the layer rect would still span multiple
-      // rows even after the fontSize cap.
-      const baseY = line.bbox.y1;
-      const effH = Math.min(lbh, Math.round(g.size * 1.15));
-      const effY = baseY - effH;
+      // Anchor the layer to the WORD bboxes, not the line bbox. Tesseract's
+      // line bbox can include empty space above the actual glyphs (rule
+      // padding, between-cell whitespace, multi-row noise) — using it as
+      // the layer rect leaves portions of the original glyph row outside
+      // the erase footprint, which is what showed up in the screenshot as
+      // a faint duplicate of the original text below the edited one.
+      // word.bbox hugs the actual ink, so:
+      //   - max(word.y1) is the true baseline (where glyphs sit)
+      //   - min(word.y0) is the true glyph top
+      // Both fall back to the line bbox when Tesseract didn't give a
+      // words array.
+      const wTops = (line.words || []).map((w) => w?.bbox?.y0).filter((y) => y > 0);
+      const wBots = (line.words || []).map((w) => w?.bbox?.y1).filter((y) => y > 0);
+      const glyphTop = wTops.length ? Math.min(...wTops) : line.bbox.y0;
+      const baseY    = wBots.length ? Math.max(...wBots) : line.bbox.y1;
+      // Tight layer height = the actual glyph extent. ascent stored as the
+      // full height anchors the drawing baseline (l.y + ascent) to the
+      // detected baseline regardless of fontSize.
+      const tightH = Math.max(8, baseY - glyphTop);
       layers.push({
         id: crypto.randomUUID(),
         text,
         originalText: text,
         x: line.bbox.x0,
-        y: effY,
+        y: glyphTop,
         w: lbw,
-        h: effH,
+        h: tightH,
         originalX: line.bbox.x0,
-        originalY: effY,
+        originalY: glyphTop,
         originalW: lbw,
-        originalH: effH,
+        originalH: tightH,
         baseY,
-        ascent: effH * 0.82,
-        descent: effH * 0.18,
+        // ascent = full height so baseY-of-draw lands exactly at the
+        // detected glyph baseline. descent kept small (just AA buffer).
+        ascent: tightH * 0.92,
+        descent: tightH * 0.08,
         angleDeg: 0,
         skewXDeg: g.isItalic ? 10 : 0,
         letterSpacing,
@@ -577,19 +588,22 @@ export default function TextEdit() {
                     || patch.letterSpacing !== undefined) {
                   next.w = measureLayerWidth(next);
                 }
-                // Auto-adjust container HEIGHT when fontSize changes — text
-                // container auto-height. Keep the baseline anchored so
-                // moving / re-rendering doesn't shift glyphs vertically.
-                // ascent / descent are recomputed from the new fontSize so
-                // descender padding stays correct after the resize.
+                // Auto-adjust container height + reanchor on fontSize change.
+                // The DETECTED baseline (next.baseY, captured at OCR time)
+                // stays fixed — only the height around it is recomputed.
+                // ascent uses the same 0.92/0.08 split we built the layer
+                // with so drawTextOverlay's baseY = l.y + l.ascent still
+                // lands exactly on the original glyph baseline.
                 if (patch.fontSize !== undefined) {
-                  const newH = Math.max(8, Math.round((+patch.fontSize || 14) * 1.15));
-                  const baseY = (next.baseY ?? (l.y + l.h));
+                  const newSize = +patch.fontSize || 14;
+                  const newH = Math.max(8, Math.round(newSize * 1.0));
+                  const newAscent = newH * 0.92;
+                  const fixedBase = (next.baseY ?? (l.y + l.ascent ?? l.h));
                   next.h = newH;
-                  next.y = baseY - newH * 0.82; // keep baseline visually fixed
-                  next.ascent = newH * 0.82;
-                  next.descent = newH * 0.18;
-                  next.lineHeight = +patch.fontSize;
+                  next.ascent = newAscent;
+                  next.descent = newH * 0.08;
+                  next.y = fixedBase - newAscent;
+                  next.lineHeight = newSize;
                 }
                 return next;
               }),
