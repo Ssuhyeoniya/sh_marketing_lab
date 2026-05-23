@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
@@ -48,8 +48,23 @@ export default function TextEdit() {
   // Canvas + pdfText references are reused so memory stays light.
   const undoStack = useRef([]);
   const redoStack = useRef([]);
-  const [, forceRerender] = useState(0);
-  const bumpHistoryUi = () => forceRerender((n) => n + 1);
+  // Undo/redo buttons read length from the refs; a tiny counter forces the
+  // single render that toggles their disabled state. Not used elsewhere — do
+  // NOT thread this through the heavy render tree.
+  const [historyTick, setHistoryTick] = useState(0);
+  const bumpHistoryUi = () => setHistoryTick((n) => n + 1);
+
+  // Drag-active flag — set by the overlay when a layer drag is in progress.
+  // The canvas-redraw effect bails while this is true; the overlay paints the
+  // moved layer via CSS so the user still sees the new position in real time,
+  // and we re-rasterise once on drag end.
+  const dragActiveRef = useRef(false);
+  const handleDragActiveChange = (active) => {
+    const was = dragActiveRef.current;
+    dragActiveRef.current = active;
+    // Drag end → schedule one final redraw so the canvas catches up.
+    if (was && !active) scheduleRedraw();
+  };
 
   const snapshotPages = (ps) => ps.map((p) => ({
     id: p.id,
@@ -85,27 +100,8 @@ export default function TextEdit() {
     bumpHistoryUi();
   };
 
-  // Auto-scroll the right panel to bring the selected layer's card to the top
-  // whenever the canvas selection changes.
-  useEffect(() => {
-    if (!selectedLayerId) return;
-    const el = document.getElementById(`layer-card-${selectedLayerId}`);
-    if (!el) return;
-    // Find the nearest scrollable ancestor (the right .panel) and scroll the
-    // card to its top, leaving a small breathing margin.
-    let scroller = el.parentElement;
-    while (scroller && scroller !== document.body) {
-      const cs = getComputedStyle(scroller);
-      if (cs.overflowY === 'auto' || cs.overflowY === 'scroll') break;
-      scroller = scroller.parentElement;
-    }
-    if (scroller) {
-      const sRect = scroller.getBoundingClientRect();
-      const eRect = el.getBoundingClientRect();
-      const delta = eRect.top - sRect.top - 8;
-      scroller.scrollBy({ top: delta, behavior: 'smooth' });
-    }
-  }, [selectedLayerId]);
+  // (The right-side per-layer card panel was replaced by the top properties
+  // toolbar — no auto-scroll effect is needed any more.)
 
   // Global keyboard shortcuts: Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y, Ctrl/Cmd+B.
   useEffect(() => {
@@ -549,14 +545,41 @@ export default function TextEdit() {
     }
   };
 
+  // ── rAF-throttled canvas redraw ──────────────────────────────────────────
+  // The redraw effect used to run synchronously on every `pages` mutation —
+  // including every drag mousemove, which fired drawImage+renderEdits 60+ Hz
+  // on a 2× rasterised page. Now we coalesce bursts into one redraw per
+  // animation frame, and skip entirely while a layer drag is active (the
+  // overlay box already shows the new position via CSS). On drag release the
+  // handler flushes a final redraw so the canvas catches up to truth.
+  const redrawRafRef = useRef(0);
+  const latestCurrentRef = useRef(current);
+  latestCurrentRef.current = current;
+
+  const scheduleRedraw = () => {
+    if (redrawRafRef.current) return;
+    redrawRafRef.current = requestAnimationFrame(() => {
+      redrawRafRef.current = 0;
+      if (dragActiveRef.current) return;       // re-check at frame time
+      const c = previewRef.current;
+      const cur = latestCurrentRef.current;
+      if (!c || !cur) return;
+      c.width = cur.canvas.width;
+      c.height = cur.canvas.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(cur.canvas, 0, 0);
+      renderEdits(ctx, cur);
+    });
+  };
+
   useEffect(() => {
-    if (!current || !previewRef.current) return;
-    const c = previewRef.current;
-    c.width = current.canvas.width;
-    c.height = current.canvas.height;
-    const ctx = c.getContext('2d');
-    ctx.drawImage(current.canvas, 0, 0);
-    renderEdits(ctx, current);
+    scheduleRedraw();
+    return () => {
+      if (redrawRafRef.current) {
+        cancelAnimationFrame(redrawRafRef.current);
+        redrawRafRef.current = 0;
+      }
+    };
   }, [current, currentIdx, pages, fontsTick]);
 
   const update = (id, patch) => {
@@ -765,23 +788,25 @@ export default function TextEdit() {
             )}
 
             <h3 style={{ marginTop: 18 }}>페이지 ({pages.length})</h3>
-            <div className="thumb-list">
+            <div
+              className="thumb-list"
+              onClick={(e) => {
+                // Click-delegation: pull the page id off the clicked card so the
+                // per-thumb onClick prop stays referentially stable and the
+                // memoised PageThumb skips renders during drag/edit.
+                const card = e.target.closest('[data-page-idx]');
+                if (!card) return;
+                const idx = +card.dataset.pageIdx;
+                if (!isNaN(idx)) setCurrentIdx(idx);
+              }}
+            >
               {pages.map((p, i) => (
-                <div
+                <PageThumb
                   key={p.id}
-                  className={'thumb' + (i === currentIdx ? ' active' : '')}
-                  onClick={() => setCurrentIdx(i)}
-                >
-                  <div className="pic">
-                    <img src={p.canvas.toDataURL()} alt="" />
-                  </div>
-                  <div className="meta">
-                    <b>Page {p.pageNum}</b>
-                    <small style={{ color: p.ocrDone ? 'var(--success)' : 'var(--text-muted)' }}>
-                      {p.ocrDone ? `텍스트 ${p.layers.length}개 · 편집 ${p.layers.filter((l) => l.edited).length}` : 'OCR 미실행'}
-                    </small>
-                  </div>
-                </div>
+                  page={p}
+                  pageIdx={i}
+                  active={i === currentIdx}
+                />
               ))}
             </div>
             <p style={{ marginTop: 12, fontSize: 11.5, color: 'var(--text-muted)' }}>
@@ -862,12 +887,13 @@ export default function TextEdit() {
                   scale={dispScale}
                   selectedId={selectedLayerId}
                   onSelect={setSelectedLayerId}
-                  onUpdate={(id, patch) => update(id, patch)}
+                  onUpdate={update}
                   editMode={editMode}
                   onDeleteLayer={softDeleteLayer}
                   onAreaErase={addEraseRegion}
                   onAreaEraseDelete={removeEraseRegion}
                   onMutateStart={pushHistory}
+                  onDragActiveChange={handleDragActiveChange}
                 />
               )}
             </div>
@@ -900,6 +926,51 @@ export default function TextEdit() {
 
 function stripExt(s) { return (s || '').replace(/\.[^.]+$/, ''); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Memoised page-thumbnail card. The previous inline implementation called
+// `p.canvas.toDataURL()` on every render — and the parent re-renders on every
+// drag mousemove (each layer patch produces a new `pages` array). For a 10-
+// page PDF rendered at 2× scale that was 10 base64 encodes per frame, the
+// dominant frame-drop source while editing.
+//
+// dataURL is now cached per canvas REFERENCE in a WeakMap, so:
+//   - The first render of a page pays the encode cost once.
+//   - Subsequent renders reuse the cached string.
+//   - When the canvas reference changes (rare — only on page replace) the
+//     cache entry naturally drops.
+// React.memo with a shallow check on `page === prev.page` skips even the
+// reconciliation work for unchanged thumbs.
+const _thumbUrlCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+function getThumbUrl(canvas) {
+  if (!canvas) return '';
+  if (!_thumbUrlCache) return canvas.toDataURL();
+  let url = _thumbUrlCache.get(canvas);
+  if (!url) {
+    url = canvas.toDataURL();
+    _thumbUrlCache.set(canvas, url);
+  }
+  return url;
+}
+const PageThumb = memo(function PageThumb({ page, pageIdx, active }) {
+  const editedCount = page.ocrDone ? page.layers.filter((l) => l.edited).length : 0;
+  return (
+    <div className={'thumb' + (active ? ' active' : '')} data-page-idx={pageIdx}>
+      <div className="pic">
+        <img src={getThumbUrl(page.canvas)} alt="" />
+      </div>
+      <div className="meta">
+        <b>Page {page.pageNum}</b>
+        <small style={{ color: page.ocrDone ? 'var(--success)' : 'var(--text-muted)' }}>
+          {page.ocrDone ? `텍스트 ${page.layers.length}개 · 편집 ${editedCount}` : 'OCR 미실행'}
+        </small>
+      </div>
+    </div>
+  );
+}, (prev, next) => (
+  prev.page === next.page &&
+  prev.pageIdx === next.pageIdx &&
+  prev.active === next.active
+));
 
 let _layerMeasureCtx = null;
 // Measure the rendered glyph width of a layer using its actual font, size and

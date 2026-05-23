@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 
 /**
  * ezPDF-style interactive overlay for PDF/OCR text layers.
@@ -10,6 +10,15 @@ import { useEffect, useRef, useState } from 'react';
  *                     with the sampled bg colour). Drag does nothing.
  *   - 'delete-area' : drag on empty canvas to paint a rectangular erase region
  *                     (covers everything inside, including images, with white).
+ *
+ * Performance
+ *   - Each `LayerBox` is wrapped in `React.memo` with a custom comparator that
+ *     watches only the fields it actually paints. A drag mutation patches a
+ *     single layer's x/y; sibling layers retain reference identity from
+ *     `update()` in TextEdit so their memoised boxes skip render entirely.
+ *   - Per-layer event handlers are stable `useCallback`s that read the layer
+ *     from the event target's dataset, so no closures over the current layer
+ *     are recreated each render — keeping `LayerBox` props identity-stable.
  */
 export default function TextLayersOverlay({
   layers,
@@ -27,11 +36,21 @@ export default function TextLayersOverlay({
   // Called once at the start of an atomic mutation (drag, edit, ...) so the
   // parent can snapshot the pre-mutation state into its undo history.
   onMutateStart,
+  // Notify parent that an active drag started / stopped — parent uses this to
+  // skip its expensive canvas redraw effect while the user is dragging. The
+  // HTML overlay box shows the new position via CSS in real time; the canvas
+  // is re-rasterised once on drag end.
+  onDragActiveChange,
 }) {
   const [drag, setDrag] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [editingCaret, setEditingCaret] = useState(null); // [start, end] selection on focus
   const [areaDrag, setAreaDrag] = useState(null); // for delete-area mode
+
+  // Latest layers in a ref so stable callbacks can resolve a layer by id
+  // without invalidating their identity on every render.
+  const layersRef = useRef(layers);
+  layersRef.current = layers;
 
   // Exit edit mode when switching modes.
   useEffect(() => { setEditingId(null); setDrag(null); setAreaDrag(null); }, [editMode]);
@@ -41,25 +60,30 @@ export default function TextLayersOverlay({
     if (!drag) return;
     let moved = false;
     let snapshotted = false;
+    let notifiedActive = false;
     const onMove = (e) => {
       const dx = (e.clientX - drag.sx) / scale;
       const dy = (e.clientY - drag.sy) / scale;
       if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
       if (!moved) return;
       if (!snapshotted) { onMutateStart?.(); snapshotted = true; }
+      if (!notifiedActive) { onDragActiveChange?.(true); notifiedActive = true; }
       // Position-only patch — do NOT mark `edited`. The redraw will lift the
       // original glyph bitmap from the source canvas instead of rasterising
       // the text with a web font, so the typography metric is preserved 1:1.
       onUpdate(drag.id, { x: Math.round(drag.ox + dx), y: Math.round(drag.oy + dy), moved: true });
     };
-    const onUp = () => setDrag(null);
+    const onUp = () => {
+      setDrag(null);
+      if (notifiedActive) onDragActiveChange?.(false);
+    };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [drag, scale, onUpdate, onMutateStart]);
+  }, [drag, scale, onUpdate, onMutateStart, onDragActiveChange]);
 
   // Area-erase drag handler.
   useEffect(() => {
@@ -94,6 +118,77 @@ export default function TextLayersOverlay({
       window.removeEventListener('mouseup', onUp);
     };
   }, [areaDrag, scale, onAreaErase]);
+
+  // ── Stable per-layer event handlers ──────────────────────────────────────
+  // These read `layersRef.current` to resolve the layer id → layer object,
+  // so the function identity stays the same across renders. That lets the
+  // `LayerBox` memo comparator skip re-rendering siblings during a drag.
+  const handleLayerMouseDown = useCallback((id, e) => {
+    const l = layersRef.current.find((x) => x.id === id);
+    if (!l) return;
+    if (editMode === 'delete-area') return;
+    e.stopPropagation();
+    if (editMode === 'delete-text') {
+      onDeleteLayer?.(id);
+      return;
+    }
+    if (editMode === 'word') {
+      onSelect?.(id);
+      const cRect = e.currentTarget.getBoundingClientRect();
+      const relClickX = e.clientX - cRect.left;
+      const text = l.text || '';
+      let sel = null;
+      if (l.words && l.words.length && l.originalW) {
+        const px = (relClickX / cRect.width) * l.originalW;
+        const clickAbsX = (l.originalX ?? l.x) + px;
+        const hit = l.words.find((w) =>
+          w.bbox && clickAbsX >= w.bbox.x0 - 2 && clickAbsX <= w.bbox.x1 + 2
+        );
+        if (hit && hit.text) {
+          const idx = text.indexOf(hit.text);
+          if (idx >= 0) sel = [idx, idx + hit.text.length];
+        }
+      }
+      if (!sel) {
+        const isWordCh = (ch) => /[\p{L}\p{N}_가-힣]/u.test(ch);
+        const approxIdx = Math.max(
+          0,
+          Math.min(text.length, Math.round((relClickX / cRect.width) * text.length))
+        );
+        let s = approxIdx, end = approxIdx;
+        while (s > 0 && isWordCh(text[s - 1])) s--;
+        while (end < text.length && isWordCh(text[end])) end++;
+        sel = s === end ? [0, text.length] : [s, end];
+      }
+      onMutateStart?.();
+      setEditingCaret(sel);
+      setEditingId(id);
+      return;
+    }
+    // sentence mode: select + start drag
+    onSelect?.(id);
+    setDrag({ id, sx: e.clientX, sy: e.clientY, ox: l.x, oy: l.y });
+  }, [editMode, onSelect, onDeleteLayer, onMutateStart]);
+
+  const handleLayerDoubleClick = useCallback((id, e) => {
+    if (editMode === 'delete-text' || editMode === 'delete-area') return;
+    e.stopPropagation();
+    e.preventDefault();
+    setDrag(null);
+    onSelect?.(id);
+    onMutateStart?.();
+    setEditingCaret(null); // null → place cursor at end inside LayerBox
+    setEditingId(id);
+  }, [editMode, onSelect, onMutateStart]);
+
+  const handleTextChange = useCallback((id, text) => {
+    onUpdate(id, { text, edited: true });
+  }, [onUpdate]);
+
+  const handleCommit = useCallback(() => {
+    setEditingId(null);
+    setEditingCaret(null);
+  }, []);
 
   const wrapPointerEvents = editMode === 'delete-area' ? 'auto' : 'none';
 
@@ -148,85 +243,21 @@ export default function TextLayersOverlay({
         if (l.visible === false) return null;
         const isSelected = selectedId === l.id;
         const isEditing = editingId === l.id;
-        const x = offsetX + l.x * scale;
-        const y = offsetY + l.y * scale;
-        const w = l.w * scale;
-        const h = l.h * scale;
         return (
           <LayerBox
             key={l.id}
             layer={l}
-            x={x}
-            y={y}
-            w={w}
-            h={h}
+            offsetX={offsetX}
+            offsetY={offsetY}
             scale={scale}
             isSelected={isSelected}
             isEditing={isEditing}
             editMode={editMode}
             caretRange={isEditing ? editingCaret : null}
-            onMouseDown={(e) => {
-              if (isEditing) return;
-              if (editMode === 'delete-area') return;
-              e.stopPropagation();
-              if (editMode === 'delete-text') {
-                onDeleteLayer?.(l.id);
-                return;
-              }
-              if (editMode === 'word') {
-                onSelect?.(l.id);
-                const cRect = e.currentTarget.getBoundingClientRect();
-                const relClickX = e.clientX - cRect.left;
-                const text = l.text || '';
-                let sel = null;
-                // Best: use OCR-detected word bboxes when present — they
-                // were captured from Tesseract per-word boxes inside the
-                // line and give pixel-accurate boundaries.
-                if (l.words && l.words.length && l.originalW) {
-                  const px = (relClickX / cRect.width) * l.originalW; // tight-bbox px
-                  const baseX = 0; // offsets are relative to layer's originalX
-                  const clickAbsX = (l.originalX ?? l.x) + px;
-                  const hit = l.words.find((w) =>
-                    w.bbox && clickAbsX >= w.bbox.x0 - 2 && clickAbsX <= w.bbox.x1 + 2
-                  );
-                  if (hit && hit.text) {
-                    const idx = text.indexOf(hit.text);
-                    if (idx >= 0) sel = [idx, idx + hit.text.length];
-                  }
-                }
-                // Fallback: proportional click-to-char with word-boundary expand.
-                if (!sel) {
-                  const isWordCh = (ch) => /[\p{L}\p{N}_가-힣]/u.test(ch);
-                  const approxIdx = Math.max(
-                    0,
-                    Math.min(text.length, Math.round((relClickX / cRect.width) * text.length))
-                  );
-                  let s = approxIdx, end = approxIdx;
-                  while (s > 0 && isWordCh(text[s - 1])) s--;
-                  while (end < text.length && isWordCh(text[end])) end++;
-                  sel = s === end ? [0, text.length] : [s, end];
-                }
-                onMutateStart?.();
-                setEditingCaret(sel);
-                setEditingId(l.id);
-                return;
-              }
-              // sentence mode: select + start drag
-              onSelect?.(l.id);
-              setDrag({ id: l.id, sx: e.clientX, sy: e.clientY, ox: l.x, oy: l.y });
-            }}
-            onDoubleClick={(e) => {
-              if (editMode === 'delete-text' || editMode === 'delete-area') return;
-              e.stopPropagation();
-              e.preventDefault();
-              setDrag(null);
-              onSelect?.(l.id);
-              onMutateStart?.();
-              setEditingCaret(null); // null → select all
-              setEditingId(l.id);
-            }}
-            onTextChange={(text) => onUpdate(l.id, { text, edited: true })}
-            onCommit={() => { setEditingId(null); setEditingCaret(null); }}
+            onMouseDown={handleLayerMouseDown}
+            onDoubleClick={handleLayerDoubleClick}
+            onTextChange={handleTextChange}
+            onCommit={handleCommit}
           />
         );
       })}
@@ -250,18 +281,32 @@ function areaRectStyle(d) {
   };
 }
 
-function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode, caretRange, onMouseDown, onDoubleClick, onTextChange, onCommit }) {
+// Fields whose change must trigger a LayerBox re-render. Excludes ephemeral
+// data the box doesn't paint (e.g. `pdfFamily`, `originalX`) so memo skips
+// purely-internal patches.
+const LAYERBOX_FIELDS = [
+  'x', 'y', 'w', 'h', 'text', 'fontSize', 'fontFamily', 'fontWeight',
+  'letterSpacing', 'color', 'bgColor', 'isBold', 'isItalic', 'edited', 'moved',
+  'visible', 'textAlign', 'angleDeg', 'skewXDeg',
+];
+
+function LayerBoxRaw({ layer: l, offsetX, offsetY, scale, isSelected, isEditing, editMode, caretRange, onMouseDown, onDoubleClick, onTextChange, onCommit }) {
   const inputRef = useRef(null);
   const [hover, setHover] = useState(false);
+
+  // Resolve canvas-px to screen-px inside the box itself so the parent doesn't
+  // re-compute x/y/w/h on every render — only the layer reference matters.
+  const x = offsetX + l.x * scale;
+  const y = offsetY + l.y * scale;
+  const w = l.w * scale;
+  const h = l.h * scale;
+
   useEffect(() => {
     if (isEditing && inputRef.current) {
       inputRef.current.focus();
       if (caretRange && caretRange.length === 2) {
         try { inputRef.current.setSelectionRange(caretRange[0], caretRange[1]); } catch {}
       } else {
-        // Place the cursor at the END of the text — never auto-select-all.
-        // Selecting all on focus meant any accidental keystroke wiped the
-        // original line, which felt like "the text suddenly changed".
         const len = inputRef.current.value.length;
         try { inputRef.current.setSelectionRange(len, len); } catch {}
       }
@@ -271,11 +316,6 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
   const displayFontSize = (+l.fontSize || 14) * scale;
   const lineH = displayFontSize;
   const baselineNudge = Math.max(0, (h - lineH) / 2);
-  // Visual padding — expands the CLICKABLE frame outside the tight glyph
-  // bbox so tight table cells are easier to grab. Layer data (x/y/w/h)
-  // stays tight, so drawTextOverlay's baseline math and canvas-text
-  // alignment are unaffected. The inner input is pushed back by the same
-  // amount to keep its glyphs perfectly stacked over the canvas glyphs.
   const PAD = 3;
 
   let border, bg;
@@ -306,8 +346,8 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
   return (
     <>
       <div
-        onMouseDown={onMouseDown}
-        onDoubleClick={onDoubleClick}
+        onMouseDown={(e) => { if (!isEditing) onMouseDown(l.id, e); }}
+        onDoubleClick={(e) => onDoubleClick(l.id, e)}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         title={isEditing ? '' : titleForMode(editMode, l.text)}
@@ -329,7 +369,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
           <input
             ref={inputRef}
             value={l.text}
-            onChange={(e) => onTextChange(e.target.value)}
+            onChange={(e) => onTextChange(l.id, e.target.value)}
             onBlur={onCommit}
             onKeyDown={(e) => {
               if (e.key === 'Escape' || e.key === 'Enter') {
@@ -342,16 +382,8 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
             onDoubleClick={(e) => e.stopPropagation()}
             style={{
               position: 'absolute',
-              // Compensate for the box's visual padding so the input glyphs
-              // sit exactly above the canvas glyphs underneath.
               left: PAD,
               top: PAD + baselineNudge,
-              // Fixed width = the box width. Without this the input had
-              // `width: auto + minWidth: 100%` and would balloon past the
-              // cell while typing, overlapping (and visually destroying)
-              // adjacent cells. The bbox-auto-resize on text change in
-              // TextEdit.update() grows w as the user types, so the input
-              // grows in lockstep — never past the layer's own bbox.
               width: `calc(100% - ${PAD * 2}px)`,
               height: `${lineH}px`,
               whiteSpace: 'nowrap',
@@ -411,6 +443,26 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, editMode
     </>
   );
 }
+
+const LayerBox = memo(LayerBoxRaw, (prev, next) => {
+  if (prev.isSelected !== next.isSelected) return false;
+  if (prev.isEditing !== next.isEditing) return false;
+  if (prev.editMode !== next.editMode) return false;
+  if (prev.scale !== next.scale) return false;
+  if (prev.offsetX !== next.offsetX || prev.offsetY !== next.offsetY) return false;
+  if (prev.caretRange !== next.caretRange) return false;
+  if (prev.onMouseDown !== next.onMouseDown) return false;
+  if (prev.onDoubleClick !== next.onDoubleClick) return false;
+  if (prev.onTextChange !== next.onTextChange) return false;
+  if (prev.onCommit !== next.onCommit) return false;
+  const a = prev.layer, b = next.layer;
+  if (a === b) return true;
+  if (!a || !b) return false;
+  for (const k of LAYERBOX_FIELDS) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+});
 
 function titleForMode(mode, text) {
   if (mode === 'delete-text') return `클릭하여 "${text}" 삭제`;
