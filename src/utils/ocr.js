@@ -148,11 +148,23 @@ export const SYSTEM_FONTS = [
   { name: 'Courier',              family: '"Courier New", Courier, monospace',                   weight: 400, kind: 'mono' },
 ];
 
-function findFont({ kind, script, weight, preferBoldName = false }) {
+// Diversified font picker. Previously every Korean sans line landed on
+// "Pretendard" because it was first in SYSTEM_FONTS and tied on score.
+// We now break ties using visual signals:
+//   - strokeRatio  : 0–1, dark-pixel-stroke / glyph-height. > 0.20 = ultra
+//                    bold, < 0.08 = thin.
+//   - fontSizePx   : rough size proxy. ≥ 38 px = title / display.
+//   - aspectRatio  : bbox w/h. Very wide-letter aspect → display fonts.
+//   - opts.tieKey  : a stable integer (e.g. a hash of the layer text) used
+//                    only to round-robin among truly equal candidates so
+//                    different lines get different faces.
+function findFont({ kind, script, weight, preferBoldName = false, strokeRatio = 0, fontSizePx = 0, tieKey = 0 }) {
   const wantBold = weight >= 600;
-  // Score by kind/script/weight match
-  let best = SYSTEM_FONTS[0], bestScore = -Infinity;
-  for (const f of SYSTEM_FONTS) {
+  const isDisplay = fontSizePx >= 38;
+  const isThin = !wantBold && strokeRatio > 0 && strokeRatio < 0.085;
+  const isUltra = wantBold && strokeRatio > 0.20;
+
+  const scored = SYSTEM_FONTS.map((f, idx) => {
     let s = 0;
     if (kind && f.kind === kind) s += 4;
     else if (kind === 'sans' && f.kind === 'serif') s -= 4;
@@ -163,16 +175,39 @@ function findFont({ kind, script, weight, preferBoldName = false }) {
       if (f.weight >= 700) s += 3;
       else if (f.weight >= 600) s += 2;
       else s -= 2;
-      // Prefer entries that ALSO advertise a Bold name so the dropdown
-      // surfaces an explicit Bold face.
       if (preferBoldName && /\bbold|black|heavy\b/i.test(f.name)) s += 2;
     } else {
       if (f.weight >= 600) s -= 2;
       else s += 2;
     }
-    if (s > bestScore) { bestScore = s; best = f; }
+    // Display-font preference for big stylised titles. Black Han Sans,
+    // Do Hyeon, Jua, and Hahmlet are quite distinct from body Pretendard.
+    if (isDisplay && /Black Han Sans|Do Hyeon|Jua|Hahmlet|Pretendard Bold|Noto Sans KR Black/i.test(f.name)) {
+      s += 2;
+    }
+    // Ultra-thick strokes → Black Han Sans
+    if (isUltra && /Black Han Sans/i.test(f.name)) s += 4;
+    // Very thin → SUIT / IBM Plex Sans KR (both have lighter feel)
+    if (isThin && /SUIT(?!.*Bold)|IBM Plex Sans KR(?!.*Bold)|Noto Sans KR Light/i.test(f.name)) s += 3;
+    return { f, s, idx };
+  });
+  // Top-tier candidates (within 1 point of the max). Round-robin via tieKey
+  // so successive layers with the same metric land on DIFFERENT faces — no
+  // more "everything is Pretendard".
+  const maxScore = Math.max(...scored.map((x) => x.s));
+  const top = scored.filter((x) => x.s >= maxScore - 1);
+  const pick = top[Math.abs(tieKey) % top.length];
+  return pick.f;
+}
+
+// Cheap stable integer hash for tie-breaking in findFont — based on the text
+// content so the same word maps to the same font on every re-render.
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < (s || '').length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
   }
-  return best;
+  return h;
 }
 
 // Font matcher using Tesseract word metadata when present, plus stroke-width
@@ -190,7 +225,8 @@ export function guessFont(word, imageCanvas) {
   let isItalic = !!word.is_italic;
   let isSerif = !!word.is_serif;
   let isMono = !!word.is_monospace;
-  let boldConfidence = 0; // 0..1, used to break ties on borderline cases
+  let boldConfidence = 0;
+  let strokeRatio = 0; // stroke-width / glyph-height, set inside the heuristic
 
   // Stroke-width heuristic. For each scan line in the bbox, find runs of dark
   // pixels (= stroke crossings) and take the median run length. The median
@@ -240,6 +276,9 @@ export function guessFont(word, imageCanvas) {
         //   bold   : ratio ≈ 0.15–0.22
         const boldThreshold = isKorean ? 0.155 : 0.130;
         if (ratio > boldThreshold) { isBold = true; boldConfidence = Math.min(1, (ratio - boldThreshold) * 8); }
+        // Hoist stroke ratio so findFont can use it for thin/thick font
+        // selection (SUIT for thin, Black Han Sans for ultra-thick).
+        strokeRatio = ratio;
       }
     } catch {}
   }
@@ -247,9 +286,17 @@ export function guessFont(word, imageCanvas) {
   const kind = isMono ? 'mono' : isSerif ? 'serif' : 'sans';
   const script = isKorean ? 'ko' : 'lat';
   const weight = isBold ? 700 : 400;
-  // Pass isBold so findFont can prefer entries with "Bold" in the name when
-  // possible (so the dropdown reads "Pretendard Bold", not bare "Pretendard").
-  const match = findFont({ kind, script, weight, preferBoldName: isBold });
+  // Width/height for display heuristics.
+  const fontSizePx = height;
+  // tieKey makes successive layers with identical metrics map to DIFFERENT
+  // fonts (round-robin among tied candidates) instead of all landing on
+  // Pretendard. Stable per text so re-renders are consistent.
+  const tieKey = hashStr(text);
+  const match = findFont({
+    kind, script, weight,
+    preferBoldName: isBold,
+    strokeRatio, fontSizePx, tieKey,
+  });
 
   // Prefer Tesseract font_size when reasonable; otherwise derive from bbox height.
   const tsize = Number(word.font_size);
@@ -377,7 +424,12 @@ export function matchPdfFont(fontName, text, style, opts = {}) {
     return { font: best, weight: best.weight };
   }
 
-  return { font: pool[0], weight: pool[0].weight };
+  // Diversification: among the top heuristic candidates, round-robin on
+  // text hash so two different lines with identical Korean-sans-400 scores
+  // don't BOTH resolve to Pretendard. Each line gets a stable but distinct
+  // pick (Pretendard / SUIT / Noto / Nanum / IBM Plex / Gothic A1 …).
+  const tieKey = Math.abs(hashStr(text));
+  return { font: pool[tieKey % pool.length], weight: pool[0].weight };
 }
 
 let _measureCtx = null;
