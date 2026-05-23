@@ -250,10 +250,26 @@ export default function TextEdit() {
           // Vertical text flag — tall, narrow cells with multiple glyphs.
           const isVertical = detectVerticalText(page.canvas, bbox, it.text);
           const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(it.text);
-          // Family chain: PDF-embedded font (pdfjs-registered) → matched web
-          // font (with its own fallbacks) → Korean OS fallbacks → generic.
+          // Family chain: matched web font → Korean OS fallbacks → generic.
+          //
+          // We deliberately DO NOT prepend the pdfjs-registered family
+          // (`it.pdfFamily`, e.g. "g_d0_f1"). pdfjs only embeds a subset
+          // of glyphs from the original PDF font with a custom CMap; when
+          // the user opens the inline editor — or even just enters edit
+          // mode — the input element re-renders the same characters
+          // through that subset and the result is unstable:
+          //   * characters at weights the subset wasn't registered for
+          //     (Bold of a Regular-only subset) fall through to a system
+          //     font, breaking the visual weight;
+          //   * some glyphs come back mapped to random Latin shapes
+          //     (e.g. "원두는" → "ATE") when the input's font-shaping
+          //     pass picks a different fallback than the canvas did.
+          // The matched web font from matchPdfFont was already chosen with
+          // width-calibration so Korean line widths don't reflow when we
+          // switch to it. pdfFamily is still stored on the layer for
+          // reference / diagnostics.
           const fontFamily = buildFontFamilyChain({
-            pdfFamily: it.pdfFamily,
+            pdfFamily: '',
             matchedFontFamily: m.font.family,
             isKorean,
             kind: m.font.kind || 'sans',
@@ -273,17 +289,27 @@ export default function TextEdit() {
               letterSpacing = delta;
             }
           }
-          // Use the tightened rect for layer geometry. Width is unchanged
-          // (PDF horizontal extent is reliable — comes from the text matrix),
-          // height/y collapse to the ink footprint.
+          // Layer geometry uses the LINE-BOX height (≈ fontSize) so the
+          // editor input — whose height is `fontSize × scale` — fits the
+          // box exactly. Earlier we shrank `h` to the visible-ink height,
+          // but that made the box smaller than the input, so the input
+          // glyphs extended past the box border and the bottom of the
+          // text was visually clipped on edit / move. Tight detection is
+          // still useful for baseline accuracy: we keep the pixel-tight
+          // `baseY` and align the line-box to it (top = baseY − ascent).
+          const ascentRatio  = it.fdAscent  != null
+            ? Math.min(0.98, Math.max(0.6, it.fdAscent  / (it.fdAscent + (it.fdDescent ?? 0.2))))
+            : 0.84;
+          const layerH = Math.max(8, it.fontSize);
+          const layerAscent  = layerH * ascentRatio;
+          const layerDescent = layerH - layerAscent;
           const layerX = bbox.x0;
-          const layerY = tightTop;
+          // Anchor the line-box to the detected ink baseline. Falls back
+          // to the raw PDF baseY when pixel-tighten declined to refine
+          // (e.g. very low-contrast cell).
+          const baselineY = tightBaseY;
+          const layerY = Math.max(0, Math.round(baselineY - layerAscent));
           const layerW = bbox.x1 - bbox.x0;
-          const layerH = Math.max(8, tightBaseY - tightTop);
-          // Re-derive ascent/descent against the tight box so drawTextOverlay's
-          // baseline = layerY + ascent lands exactly on the detected ink-bottom.
-          const tightAscent  = layerH * (it.fdAscent  != null ? Math.min(0.98, Math.max(0.6, it.fdAscent  / (it.fdAscent + (it.fdDescent ?? 0.2)))) : 0.92);
-          const tightDescent = layerH - tightAscent;
           return {
             id: crypto.randomUUID(),
             text: it.text,
@@ -296,9 +322,9 @@ export default function TextEdit() {
             originalY: layerY,
             originalW: layerW,
             originalH: layerH,
-            baseY: tightBaseY,
-            ascent: tightAscent,
-            descent: tightDescent,
+            baseY: baselineY,
+            ascent: layerAscent,
+            descent: layerDescent,
             angleDeg: it.angleDeg || (isVertical ? -90 : 0),
             skewXDeg: it.skewXDeg || 0,
             isVertical,
@@ -500,10 +526,17 @@ export default function TextEdit() {
         x0: wordLeft, y0: wordTop, x1: wordRight, y1: wordBot,
       });
       const layerX = tight ? tight.x0 : wordLeft;
-      const layerY = tight ? tight.glyphTop : wordTop;
       const layerW = (tight ? tight.x1 : wordRight) - layerX;
       const baseY  = tight ? tight.baseY : wordBot;
-      const tightH = Math.max(8, baseY - layerY);
+      // Line-box geometry anchored to the detected baseline. Using a tight
+      // h = baseY − glyphTop made the editor input (height = fontSize ×
+      // scale) overflow the box on edit, which clipped the bottom of the
+      // text on move. fontSize-based h keeps box ↔ input ↔ canvas
+      // baselines in sync; baseY remains accurate from the pixel scan.
+      const layerH = Math.max(8, g.size);
+      const layerAscent  = layerH * 0.84;
+      const layerDescent = layerH - layerAscent;
+      const layerY = Math.max(0, Math.round(baseY - layerAscent));
       const isVertical = detectVerticalText(page.canvas, {
         x0: layerX, y0: layerY, x1: layerX + layerW, y1: baseY,
       }, text);
@@ -514,16 +547,14 @@ export default function TextEdit() {
         x: layerX,
         y: layerY,
         w: layerW,
-        h: tightH,
+        h: layerH,
         originalX: layerX,
         originalY: layerY,
         originalW: layerW,
-        originalH: tightH,
+        originalH: layerH,
         baseY,
-        // ascent = full height so baseY-of-draw lands exactly at the
-        // detected glyph baseline. descent kept small (just AA buffer).
-        ascent: tightH * 0.92,
-        descent: tightH * 0.08,
+        ascent: layerAscent,
+        descent: layerDescent,
         angleDeg: isVertical ? -90 : 0,
         isVertical,
         skewXDeg: g.isItalic ? 10 : 0,
@@ -1386,19 +1417,20 @@ function drawTextOverlay(ctx, l) {
   const weight = +l.fontWeight || 400;
   ctx.save();
   // Clip the redraw to the union of the layer's ORIGINAL footprint and its
-  // CURRENT bbox, with explicit padding for ascender/descender extent. The
-  // previous PADC=2 was too tight: for a 44 px headline the descender pixels
-  // of "권" / "양" sit ~3–4 px below the OCR bbox bottom, so they were
-  // sliced off by the clip on every redraw. fontSize-relative padding
-  // ensures the clip never bites into the rendered glyph footprint.
+  // CURRENT bbox, with padding generous enough to cover ascender/descender
+  // ink AND lateral side-bearing of bolder weights. The clip is what stops
+  // the redraw from bleeding past the layer rect into neighbouring text;
+  // the padding is what stops the redraw from CHOPPING off the bottom of
+  // descenders ("g/p/y") or the right side of a bold glyph's overhang.
   {
-    const PADC = Math.max(4, Math.round(fontSize * 0.20));
+    const PADC_V = Math.max(6, Math.round(fontSize * 0.40));
+    const PADC_H = Math.max(6, Math.round(fontSize * 0.30));
     const cox = l.originalX ?? l.x, coy = l.originalY ?? l.y;
     const cow = l.originalW ?? l.w, coh = l.originalH ?? l.h;
-    const cx = Math.min(cox, l.x) - PADC;
-    const cy = Math.min(coy, l.y) - PADC;
-    const cw = Math.max(cox + cow, l.x + l.w) - cx + PADC;
-    const ch = Math.max(coy + coh, l.y + l.h) - cy + PADC;
+    const cx = Math.min(cox, l.x) - PADC_H;
+    const cy = Math.min(coy, l.y) - PADC_V;
+    const cw = Math.max(cox + cow, l.x + l.w) - cx + PADC_H;
+    const ch = Math.max(coy + coh, l.y + l.h) - cy + PADC_V;
     ctx.beginPath();
     ctx.rect(cx, cy, cw, ch);
     ctx.clip();
@@ -1417,7 +1449,13 @@ function drawTextOverlay(ctx, l) {
   const ascent = l.ascent || m.actualBoundingBoxAscent || fontSize * 0.82;
   const descent = l.descent || m.actualBoundingBoxDescent || fontSize * 0.18;
   const newW = m.width;
-  const baseY = l.ascent ? (l.y + l.ascent) : (l.y + l.h);
+  // Baseline: prefer the layer's stored `baseY` (set from glyph-tight
+  // detection at OCR time and refreshed when the layer moves). Falling
+  // back to `l.y + l.ascent` keeps older layers without baseY working.
+  // When the layer moved, `baseY` was stored in canvas-absolute pixels at
+  // OCR time so we need to translate by (l.y − l.originalY).
+  const moveDY = (l.y - (l.originalY ?? l.y));
+  const baseY = (l.baseY != null) ? (l.baseY + moveDY) : (l.y + ascent);
   // Resolve text-align — shift the draw-X so center/right text sits inside
   // the layer rect without changing the bbox itself.
   const align = l.textAlign || 'left';
