@@ -25,6 +25,64 @@ export async function renderPageToCanvas(pdf, pageNum, scale = 1.5) {
   return canvas;
 }
 
+// 2D affine transform compose using PDF/pdfjs convention [a,b,c,d,e,f]
+// representing the 3x3 matrix [a b 0; c d 0; e f 1] for row vectors.
+// Equivalent to pdfjs's removed `Util.transform(m1, m2)` (= m1·m2).
+function composeAffine(m1, m2) {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ];
+}
+
+// Extract the native PDF text layer for a page at the same rasterization scale
+// as renderPageToCanvas, so item coordinates match the canvas pixel grid.
+// Returns { items, styles } where styles is pdfjs's font metadata map keyed by
+// item.fontName. Each item: { text, fontName, fontSize, angleDeg, x, y, baseY,
+// w, h, ascent, descent }. Coordinates are in canvas pixels.
+export async function extractPageTextItems(pdf, pageNum, canvasScale = 2) {
+  const page = await pdf.getPage(pageNum);
+  const viewport = page.getViewport({ scale: canvasScale });
+  const tc = await page.getTextContent();
+  const items = [];
+  for (const it of tc.items) {
+    if (!it || it.type) continue; // marked-content boundaries
+    if (!it.str || !it.str.trim()) continue;
+    if (!it.transform || it.transform.length < 6) continue;
+    const tx = composeAffine(viewport.transform, it.transform);
+    const baseX = tx[4];
+    const baseY = tx[5];
+    const fontSize = Math.hypot(tx[2], tx[3]);
+    if (!isFinite(fontSize) || fontSize < 1) continue;
+    const angleDeg = (Math.atan2(tx[1], tx[0]) * 180) / Math.PI;
+    // item.width / item.height are in PDF user units → canvas-px via canvasScale
+    const wCanvas = (it.width || 0) * canvasScale;
+    const hCanvas = (it.height || fontSize / canvasScale) * canvasScale;
+    // Ascent/descent approximation when not provided by pdfjs styles.
+    const ascent = fontSize * 0.82;
+    const descent = fontSize * 0.18;
+    items.push({
+      text: it.str,
+      fontName: it.fontName || '',
+      fontSize,
+      angleDeg,
+      x: baseX,
+      y: baseY - ascent,
+      baseY,
+      w: Math.max(wCanvas, fontSize * 0.5),
+      h: hCanvas > 1 ? hCanvas : ascent + descent,
+      ascent,
+      descent,
+      hasEOL: !!it.hasEOL,
+    });
+  }
+  return { items, styles: tc.styles || {} };
+}
+
 export async function pdfToImages(file, format = 'png', scale = 2) {
   const pdf = await loadPdfJs(file);
   const images = [];

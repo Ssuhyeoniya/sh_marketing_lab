@@ -106,3 +106,33 @@ export function guessFont(word, imageCanvas) {
 
   return { font: match, size, weight };
 }
+
+// Map a PDF font name (e.g., "ABCDEF+NanumGothic-Bold", "Helvetica-BoldOblique")
+// to the closest SYSTEM_FONT. We use the name itself plus pdfjs's optional
+// `style` ({ fontFamily, ascent, descent, vertical }) hints when present.
+export function matchPdfFont(fontName, text, style) {
+  const raw = String(fontName || '').replace(/^[A-Z]{6}\+/, '');
+  const lower = raw.toLowerCase();
+  const styleFamily = (style?.fontFamily || '').toLowerCase();
+  const combined = `${lower} ${styleFamily}`;
+  const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(text || '');
+  const isBold =
+    /bold|black|heavy|semibold|demi/.test(combined) ||
+    (style?.fontFamily && /\b700\b|\b800\b|\b900\b/.test(style.fontFamily));
+  const isLight = /light|thin/.test(combined);
+  const isSerif = /serif|times|roman|batang|myungjo|gungsuh|sourcehanserif|notoserif/.test(combined);
+  const isMono = /mono|courier|consolas|menlo|gulimche/.test(combined);
+  const weight = isBold ? 700 : isLight ? 300 : 400;
+  const kind = isMono ? 'mono' : isSerif ? 'serif' : 'sans';
+  const script = isKorean ? 'ko' : 'lat';
+  let best = SYSTEM_FONTS[0], bestScore = -1;
+  for (const f of SYSTEM_FONTS) {
+    let s = 0;
+    if (f.kind === kind) s += 4;
+    if (!f.script || f.script === script) s += 2;
+    const wd = Math.abs((f.weight || 400) - weight);
+    s += Math.max(0, 3 - Math.round(wd / 100));
+    if (s > bestScore) { bestScore = s; best = f; }
+  }
+  return { font: best, weight };
+}
