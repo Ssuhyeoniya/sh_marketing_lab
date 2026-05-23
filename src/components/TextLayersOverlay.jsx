@@ -27,7 +27,6 @@ export default function TextLayersOverlay({
 }) {
   const [drag, setDrag] = useState(null);
   const [editingId, setEditingId] = useState(null);
-  const [clickAt, setClickAt] = useState(0);
 
   useEffect(() => {
     if (!drag) return;
@@ -77,15 +76,15 @@ export default function TextLayersOverlay({
             onMouseDown={(e) => {
               if (isEditing) return;
               e.stopPropagation();
-              const now = Date.now();
-              const isDouble = now - clickAt < 300 && selectedId === l.id;
-              setClickAt(now);
-              if (isDouble) {
-                setEditingId(l.id);
-              } else {
-                onSelect?.(l.id);
-                setDrag({ id: l.id, sx: e.clientX, sy: e.clientY, ox: l.x, oy: l.y });
-              }
+              onSelect?.(l.id);
+              setDrag({ id: l.id, sx: e.clientX, sy: e.clientY, ox: l.x, oy: l.y });
+            }}
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              setDrag(null);
+              onSelect?.(l.id);
+              setEditingId(l.id);
             }}
             onTextChange={(text) => onUpdate(l.id, { text, edited: true })}
             onCommit={() => setEditingId(null)}
@@ -96,7 +95,7 @@ export default function TextLayersOverlay({
   );
 }
 
-function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseDown, onTextChange, onCommit }) {
+function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseDown, onDoubleClick, onTextChange, onCommit }) {
   const inputRef = useRef(null);
   const [hover, setHover] = useState(false);
   useEffect(() => {
@@ -105,6 +104,10 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
       inputRef.current.select();
     }
   }, [isEditing]);
+
+  // Display fontSize in CSS px — match OCR-detected size exactly, no clamping,
+  // so the inline editor renders text at the same scale as the canvas output.
+  const displayFontSize = (+l.fontSize || 14) * scale;
 
   // Border styles by state — all clearly visible.
   let border, bg;
@@ -127,6 +130,7 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
     <>
       <div
         onMouseDown={onMouseDown}
+        onDoubleClick={onDoubleClick}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         title={isEditing ? '' : `"${l.text}" · 클릭=선택 · 드래그=이동 · 더블클릭=편집`}
@@ -158,19 +162,29 @@ function LayerBox({ layer: l, x, y, w, h, scale, isSelected, isEditing, onMouseD
               e.stopPropagation();
             }}
             onMouseDown={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
             style={{
               position: 'absolute',
-              inset: 0,
-              width: '100%',
+              left: 0,
+              top: 0,
+              // Allow the input to overflow when the displayed font size is
+              // larger than the original OCR bbox (e.g., the user typed more
+              // characters). This keeps the visible glyphs WYSIWYG with the
+              // canvas output instead of clipping or auto-scaling.
+              width: 'auto',
+              minWidth: '100%',
               height: '100%',
+              whiteSpace: 'nowrap',
               border: 'none',
               outline: 'none',
               background: l.bgColor || '#ffffff',
               color: l.color || '#111111',
-              fontSize: Math.max(10, l.fontSize * scale),
+              fontSize: displayFontSize,
+              lineHeight: `${h}px`,
               fontFamily: l.fontFamily,
               fontWeight: l.fontWeight,
               padding: 0,
+              margin: 0,
               boxSizing: 'border-box',
               textAlign: 'left',
             }}
