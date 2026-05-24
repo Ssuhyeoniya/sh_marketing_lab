@@ -347,7 +347,20 @@ export default function TextEdit() {
         .filter((it) => {
           const t = (it.text || '').trim();
           if (!t) return false;
-          if (it.w < 2 || it.h < 4) return false;
+          // Size floor — bumped from (w<2, h<4) to (w<6, h<6). Sub-6-px
+          // boxes are almost always table-rule glyphs, dingbat dividers,
+          // or a single PUA decoration char that pdfjs surfaced as a
+          // "text" item. Real legible body text in our 2×-scaled canvas
+          // grid is never < 10 px tall; the 6-px floor still leaves
+          // headroom for small superscripts but eliminates the "tiny
+          // stray box that moves with the row" complaint.
+          if (it.w < 6 || it.h < 6) return false;
+          // Aspect-based rule-line guard. A 25:1+ wide box made entirely
+          // of underscores / dashes / dots / box-drawing chars is a
+          // horizontal rule pretending to be text. Catches "________"
+          // and "————" items that pass the alphanumeric check on a
+          // lone underscore.
+          if (it.w / Math.max(1, it.h) > 25 && /^[_·•．。⋯…\-—–=─━]+$/.test(t)) return false;
           if (!/[a-zA-Z0-9가-힣]|[^ -]/.test(t)) return false;
           // Per-item garble drop: even on pages whose overall garble ratio
           // sits below the page-level OCR-fallback threshold, individual
@@ -1024,6 +1037,19 @@ export default function TextEdit() {
                 if (MOVE_KEYS.some((k) => patch[k] !== undefined)) next.moved = true;
                 if ('color' in patch) next.colorEdited = true;
                 if ('bgColor' in patch) next.bgColorEdited = true;
+                // When the user CHANGES the text content, drop the
+                // heuristic letterSpacing that was reconstructed from the
+                // ORIGINAL PDF advance widths. That value is meaningful
+                // only for the original glyph run — applying it to typed
+                // characters spreads them out visibly (the "글자 사이가
+                // 벌어짐 / 폰트 패밀리 깨짐" symptom: "단,파손 등 고객과실"
+                // → "단 파 손 등 고 객 과 실"). Letting the matched font's
+                // native advance widths drive layout keeps the committed
+                // result tight and readable. User can still hand-tune the
+                // 자간 control afterwards if needed.
+                if (patch.text !== undefined && patch.letterSpacing === undefined) {
+                  next.letterSpacing = 0;
+                }
                 // Auto-resize the bbox WIDTH whenever any property that
                 // affects rendered glyph width changes (text/font/size/
                 // weight/letter-spacing). Without this the inline editor's
@@ -1565,18 +1591,32 @@ function canMerge(a, b) {
   // fragment even if everything else lines up — it's a NEW sentence in the
   // same line and the user wants to edit it independently.
   const aText = (a.text || '').trim();
+  const bText = (b.text || '').trim();
   if (/[.!?。]$/.test(aText) || /(다|요)\.$/.test(aText)) return false;
   // Parenthetical-label guard. "(VAT포함)" sitting next to a regular run
   // should stay its own layer — the user wants per-label selection.
-  if (/^[(（[].+[)）\]]\s*$/.test((b.text || '').trim())) return false;
+  if (/^[(（[].+[)）\]]\s*$/.test(bText)) return false;
   if (/^[(（[].+[)）\]]\s*$/.test(aText)) return false;
+  // Table-cell guard — refuse to merge a standalone short number/token with
+  // the next run. In tabular layouts the "No" / index column is emitted as
+  // a tiny item ("1", "4", "11") that sits one cell-gap away from the
+  // longer product-name run. Without this guard the gap stays under our
+  // x-threshold and the two get joined, producing one editable layer that
+  // spans the column boundary (visible as a comically-wide edit box). A
+  // numeric label is never the start of a Korean sentence, so a hard rule
+  // is safe.
+  if (/^\d{1,3}[.)]?$/.test(aText)) return false;
   // x-ordering: b must sit to the right of a, with a gap small enough to be
-  // an in-sentence spacer. 1.2 em is roughly one full-width Korean glyph or
-  // a wide Latin word-space — anything more and the two fragments belong to
-  // distinct sentences / cells.
+  // an in-sentence spacer. Threshold = 0.7 em — large enough to cover the
+  // 1-em full-width Korean word-space that occasionally appears mid-phrase,
+  // small enough to NOT bridge the typical table cell-padding gap (usually
+  // ≥ 1 em on each side of the column rule, so ≥ 2 em centre-to-edge).
+  // The previous 1.2-em threshold reliably joined cross-cell runs whose
+  // padding sat right at the cell rule, which is what caused row 4's "4"
+  // to merge into "프리미엄 원두 …".
   const gap = b.x - (a.x + a.w);
   if (gap < -2) return false;             // overlapping → don't touch
-  if (gap > fz * 1.2) return false;       // too far apart
+  if (gap > fz * 0.7) return false;       // too far apart
   return true;
 }
 
@@ -2010,7 +2050,14 @@ function ensureContrast(fg, bg) {
   if (!a || !b) return fg;
   const la = 0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2];
   const lb = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2];
-  if (Math.abs(la - lb) < 40) return lb > 128 ? '#111111' : '#ffffff';
+  // Only override when the contrast is genuinely unreadable. A coloured
+  // run (red warning text, blue link, etc.) can sit at a luminance close
+  // to the page bg and still be perfectly legible because of the hue
+  // difference — forcing it to black/white here was the cause of the
+  // "글자 색상이 깨짐" symptom where red headings turned grey on commit.
+  // 15 keeps the safety net for almost-invisible runs (near-white on
+  // white) without touching any visually distinct colour.
+  if (Math.abs(la - lb) < 15) return lb > 128 ? '#111111' : '#ffffff';
   return fg;
 }
 function parseRgb(s) {
