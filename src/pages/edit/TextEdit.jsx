@@ -40,6 +40,14 @@ export default function TextEdit() {
   const [selectedLayerId, setSelectedLayerId] = useState(null);
   const [dispScale, setDispScale] = useState(1);
   const [editMode, setEditMode] = useState('sentence');
+  // Id of the layer whose inline <input> is currently open. Used by
+  // `renderEdits` to (a) erase the original glyph footprint immediately
+  // on edit open and (b) skip the canvas text draw for that layer, so the
+  // user only sees their own typing — not the canvas-rendered copy bleeding
+  // through on top of the input (the "텍스트가 덮어지는" issue).
+  const [editingLayerId, setEditingLayerId] = useState(null);
+  const editingLayerIdRef = useRef(null);
+  editingLayerIdRef.current = editingLayerId;
   // Confirm dialog used by both delete modes — guards against accidental
   // wipes. Enter = Yes, Esc = No (wired inside the dialog component).
   const [confirmState, setConfirmState] = useState(null);
@@ -981,7 +989,10 @@ export default function TextEdit() {
       c.height = cur.canvas.height;
       const ctx = c.getContext('2d');
       ctx.drawImage(cur.canvas, 0, 0);
-      renderEdits(ctx, cur);
+      // Pass the currently-editing layer id so renderEdits can erase the
+      // pre-edit glyphs immediately and skip drawing that layer on canvas —
+      // the inline <input> is the sole renderer while editing.
+      renderEdits(ctx, cur, editingLayerIdRef.current);
     });
   };
 
@@ -995,7 +1006,7 @@ export default function TextEdit() {
     // cleanup kept cancelling the rAF before it could ever fire, and the
     // canvas stayed empty even though the page object was sitting in state.
     scheduleRedraw();
-  }, [current, currentIdx, pages, fontsTick]);
+  }, [current, currentIdx, pages, fontsTick, editingLayerId]);
 
   const update = (id, patch) => {
     setPages((ps) =>
@@ -1323,6 +1334,7 @@ export default function TextEdit() {
                   onAreaEraseDelete={removeEraseRegion}
                   onMutateStart={pushHistory}
                   onDragActiveChange={handleDragActiveChange}
+                  onEditingChange={setEditingLayerId}
                 />
               )}
             </div>
@@ -1788,10 +1800,15 @@ function splitOcrLineByCells(line) {
 //      typography metric, kerning, and Korean glyph widths are byte-perfect.
 //   3. For edited layers, rasterise the new text with the matched web font.
 //   4. Paint user-drawn area-erase rectangles last so they always win.
-function renderEdits(ctx, p) {
+function renderEdits(ctx, p, editingLayerId) {
   const src = p.canvas;
   for (const l of p.layers) {
-    const needsErase = l.deleted || l.edited || (l.moved && !l.deleted);
+    // Editing layer ALWAYS gets erased — even before the first keystroke —
+    // so the user never sees the canvas-rendered original peeking through
+    // the opaque <input>. Without this, opening the editor briefly shows
+    // the old glyphs underneath until `l.edited` flips true on first input.
+    const isEditing = editingLayerId && l.id === editingLayerId;
+    const needsErase = l.deleted || l.edited || (l.moved && !l.deleted) || isEditing;
     if (!needsErase) continue;
     // Erase rect = UNION of (original glyph footprint) ∪ (new draw extent)
     // with generous padding. Previous versions used only the pixel-tight
@@ -1851,6 +1868,13 @@ function renderEdits(ctx, p) {
   }
   for (const l of p.layers) {
     if (l.deleted || !l.edited || l.visible === false) continue;
+    // Skip the editing layer — its inline <input> is the sole renderer
+    // while the editor is open. Drawing here too produces a doubled
+    // overlap (canvas glyphs behind input glyphs at a slightly different
+    // baseline, the visible artefact from issues #1 & #2). On commit,
+    // editingLayerId clears, scheduleRedraw fires, and the canvas takes
+    // over the rendering cleanly.
+    if (editingLayerId && l.id === editingLayerId) continue;
     drawTextOverlay(ctx, l);
   }
   for (const r of (p.eraseRegions || [])) {
