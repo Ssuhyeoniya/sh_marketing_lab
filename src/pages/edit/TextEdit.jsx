@@ -245,16 +245,6 @@ export default function TextEdit() {
       //                    almost certainly PUA glyph-name fallbacks for
       //                    CJK glyphs the subset CMap couldn't decode).
       const _allItems = page.pdfText.items;
-      const _garbledFonts = new Set();
-      let _hangulCharCount = 0, _totalCharCount = 0;
-      for (const it of _allItems) {
-        const t = (it.text || '').trim();
-        if (!t) continue;
-        _totalCharCount += t.length;
-        _hangulCharCount += (t.match(/[가-힣]/g) || []).length;
-        if (looksGarbledKorean(t) && it.fontName) _garbledFonts.add(it.fontName);
-      }
-      const _isKoreanPage = _totalCharCount > 0 && (_hangulCharCount / _totalCharCount) > 0.2;
       const _ALLOWED_STANDALONE = new Set([
         'AI', 'AR', 'VR', 'IT', 'OS', 'PC', 'TV', 'PD', 'CD', 'DVD', 'USB',
         'HD', 'FHD', 'UHD', '4K', '8K', 'OK', 'PDF', 'JPG', 'PNG', 'GIF',
@@ -271,6 +261,59 @@ export default function TextEdit() {
         if (_ALLOWED_STANDALONE.has(s)) return false;
         return true;
       };
+      // Sub-token scan: split the item on whitespace + punctuation, then
+      // check each fragment. Catches the case where pdfjs bundled a
+      // garbled Latin run with a SHORT Korean fragment in the same item
+      // (e.g. "단위 EES" — only 2 Hangul chars, below the looksGarbledKorean
+      // 3-char threshold, so the bundled form slipped past per-item filter
+      // AND post-merge final-pass. Sub-token scan finds EES directly.
+      const _SUBTOKEN_SPLIT = /[\s,.()[\]{}<>"'/\\:;!?·•|\-_*]+/;
+      const _hasEmbeddedLatinGarble = (t) => {
+        for (const st of t.split(_SUBTOKEN_SPLIT)) {
+          if (!st) continue;
+          if (/^[A-Z]{2,4}$/.test(st) && !_ALLOWED_STANDALONE.has(st)) return true;
+        }
+        return false;
+      };
+      // Two-pass scan. First: per-item Hangul count + look-garbled detection.
+      // Second: on Korean pages, also treat standalone-Latin garble AND
+      // embedded-Latin garble as evidence a fontName is suspect — extends
+      // garbledFonts so OTHER clean-looking items in the same font subset
+      // also get scrutinised by the per-item filter below.
+      let _hangulCharCount = 0, _totalCharCount = 0;
+      const _suspectByFont = new Map(); // fontName → array of sample texts
+      const _markSuspect = (it, reason) => {
+        if (!it.fontName) return;
+        if (!_suspectByFont.has(it.fontName)) _suspectByFont.set(it.fontName, []);
+        const samples = _suspectByFont.get(it.fontName);
+        if (samples.length < 3) samples.push(`${reason}:"${(it.text || '').trim()}"`);
+      };
+      for (const it of _allItems) {
+        const t = (it.text || '').trim();
+        if (!t) continue;
+        _totalCharCount += t.length;
+        _hangulCharCount += (t.match(/[가-힣]/g) || []).length;
+        if (looksGarbledKorean(t)) _markSuspect(it, 'looksGarbled');
+      }
+      const _isKoreanPage = _totalCharCount > 0 && (_hangulCharCount / _totalCharCount) > 0.2;
+      if (_isKoreanPage) {
+        for (const it of _allItems) {
+          const t = (it.text || '').trim();
+          if (!t) continue;
+          if (_isStandaloneGarble(t)) { _markSuspect(it, 'standalone'); continue; }
+          if (_hasEmbeddedLatinGarble(t) && /[가-힣]/.test(t)) _markSuspect(it, 'embedded');
+        }
+      }
+      const _garbledFonts = new Set(_suspectByFont.keys());
+      // Diagnostic — visible in browser devtools so we can verify why a
+      // specific page didn't flip a layer to dropped.
+      console.log('[TextEdit] Issue #26 A garble analysis', {
+        page: page.pageNum, totalItems: _allItems.length,
+        totalChars: _totalCharCount, hangulChars: _hangulCharCount,
+        hangulRatio: _totalCharCount ? +(_hangulCharCount / _totalCharCount).toFixed(3) : 0,
+        isKoreanPage: _isKoreanPage,
+        garbledFonts: Array.from(_suspectByFont.entries()).map(([f, s]) => ({ font: f, samples: s })),
+      });
 
       const layers = page.pdfText.items
         .filter((it) => {
@@ -304,6 +347,12 @@ export default function TextEdit() {
               if (!hasHangul || hasSuspectLatin) return false;
             }
             if (_isStandaloneGarble(t)) return false;
+            // Embedded-Latin garble: catches "단위 EES" style where the
+            // Latin run is bundled with too few Hangul chars (< 3) for
+            // looksGarbledKorean to fire. On a Korean page any short
+            // uppercase Latin token that isn't a recognised acronym is
+            // almost certainly a PUA-CJK glyph-name fallback.
+            if (_hasEmbeddedLatinGarble(t)) return false;
           }
           return true;
         })
@@ -473,13 +522,20 @@ export default function TextEdit() {
       // the FINAL layer text — so any path that produced a garbled layer
       // gets cleaned up here.
       if (_isKoreanPage) {
+        const beforeCount = mergedLayers.length;
         mergedLayers = mergedLayers.filter((l) => {
           const t = (l.text || '').trim();
           if (!t) return false;
           if (looksGarbledKorean(t)) return false;
           if (_isStandaloneGarble(t)) return false;
+          if (_hasEmbeddedLatinGarble(t)) return false;
           return true;
         });
+        if (mergedLayers.length !== beforeCount) {
+          console.log(
+            `[TextEdit] Issue #26 A final-pass dropped ${beforeCount - mergedLayers.length} layer(s) on page ${page.pageNum}`
+          );
+        }
       }
       onProg?.({ progress: 0.95, stage: '레이어 적용 중' });
       await sleep(40);
