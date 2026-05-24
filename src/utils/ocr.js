@@ -529,6 +529,15 @@ function findFont({ kind, script, weight, preferBoldName = false, strokeRatio = 
       if (f.weight >= 600) s -= 2;
       else s += 2;
     }
+    // Korean-sans body-text canonical bias. Pretendard is the most common
+    // modern Korean sans across PDFs we see; defaulting to it gives the
+    // user a stable, predictable rendering instead of bouncing between
+    // Pretendard / SUIT / Nanum Gothic / Gothic A1 every layer (the old
+    // tie-breaker round-robin actively made the page look inconsistent
+    // post-edit, the "폰트 패밀리가 깨짐" complaint).
+    if (script === 'ko' && kind === 'sans' && !isDisplay && /^Pretendard($| )/i.test(f.name)) {
+      s += 3;
+    }
     // Display-font preference for big stylised titles. Black Han Sans,
     // Do Hyeon, Jua, and Hahmlet are quite distinct from body Pretendard.
     if (isDisplay && /Black Han Sans|Do Hyeon|Jua|Hahmlet|Pretendard Bold|Noto Sans KR Black/i.test(f.name)) {
@@ -540,13 +549,14 @@ function findFont({ kind, script, weight, preferBoldName = false, strokeRatio = 
     if (isThin && /SUIT(?!.*Bold)|IBM Plex Sans KR(?!.*Bold)|Noto Sans KR Light/i.test(f.name)) s += 3;
     return { f, s, idx };
   });
-  // Top-tier candidates (within 1 point of the max). Round-robin via tieKey
-  // so successive layers with the same metric land on DIFFERENT faces — no
-  // more "everything is Pretendard".
-  const maxScore = Math.max(...scored.map((x) => x.s));
-  const top = scored.filter((x) => x.s >= maxScore - 1);
-  const pick = top[Math.abs(tieKey) % top.length];
-  return pick.f;
+  // Single deterministic pick — highest score, lowest SYSTEM_FONTS index on
+  // a tie. The previous tieKey round-robin (intended to "diversify" away
+  // from everything being Pretendard) ended up giving adjacent body-text
+  // lines DIFFERENT faces, which is exactly what the user perceives as
+  // the font breaking on edit. Stable, predictable, Pretendard-leaning
+  // for Korean sans is the right trade-off.
+  scored.sort((a, b) => (b.s - a.s) || (a.idx - b.idx));
+  return scored[0].f;
 }
 
 // Cheap stable integer hash for tie-breaking in findFont — based on the text
@@ -558,6 +568,72 @@ function hashStr(s) {
   }
   return h;
 }
+
+// Stroke-width bold detector. Works off the rendered page bitmap so it's
+// independent of font-name signals — important for PDF text items whose
+// embedded font name doesn't include the word "Bold" but whose glyphs
+// are visually bold (the common case for custom corporate fonts).
+//
+// For each scan line in the bbox, finds runs of dark pixels (stroke
+// crossings) and takes the median run length. Median stroke width /
+// glyph height is a robust bold signal across scripts — Korean glyphs
+// naturally have more strokes than Latin so a flat density threshold
+// would over-trigger; per-row stroke width is invariant to complexity.
+//
+// Returns { isBold, isUltra, strokeRatio }. strokeRatio is 0 when the
+// bbox is degenerate or the canvas read fails — caller can treat that
+// as "no signal" and fall back to font-name heuristics.
+export function detectBoldByStroke(canvas, bbox, isKorean) {
+  if (!canvas || !bbox) return { isBold: false, isUltra: false, strokeRatio: 0 };
+  try {
+    const ctx = canvas.getContext('2d');
+    const x0 = Math.max(0, Math.floor(bbox.x0));
+    const y0 = Math.max(0, Math.floor(bbox.y0));
+    const x1 = Math.min(canvas.width, Math.ceil(bbox.x1));
+    const y1 = Math.min(canvas.height, Math.ceil(bbox.y1));
+    const width = x1 - x0;
+    const height = y1 - y0;
+    if (width < 6 || height < 6) return { isBold: false, isUltra: false, strokeRatio: 0 };
+    const w = Math.min(width, 240);
+    const h = Math.min(height, 80);
+    const data = ctx.getImageData(x0, y0, w, h).data;
+    const rowStrokes = [];
+    for (let y = 0; y < h; y++) {
+      const rowStart = y * w * 4;
+      let lumSum = 0;
+      for (let x = 0; x < w; x++) {
+        const i = rowStart + x * 4;
+        lumSum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      }
+      const rowMean = lumSum / w;
+      const thr = Math.min(160, rowMean - 30);
+      const runs = [];
+      let runLen = 0;
+      for (let x = 0; x < w; x++) {
+        const i = rowStart + x * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum < thr) runLen++;
+        else if (runLen > 0) { runs.push(runLen); runLen = 0; }
+      }
+      if (runLen > 0) runs.push(runLen);
+      if (runs.length) rowStrokes.push(median(runs));
+    }
+    if (rowStrokes.length < 4) return { isBold: false, isUltra: false, strokeRatio: 0 };
+    const stroke = median(rowStrokes);
+    const ratio = stroke / h;
+    // Empirical thresholds (same as guessFont): Korean naturally has
+    // thicker strokes so the bold threshold sits slightly higher.
+    const boldThreshold = isKorean ? 0.130 : 0.110;
+    return {
+      isBold: ratio > boldThreshold,
+      isUltra: ratio > 0.20,
+      strokeRatio: ratio,
+    };
+  } catch {
+    return { isBold: false, isUltra: false, strokeRatio: 0 };
+  }
+}
+
 
 // Font matcher using Tesseract word metadata when present, plus stroke-width
 // fallback for bold detection. Returns { font, size, weight, isBold, isItalic }.
@@ -775,7 +851,28 @@ export function matchPdfFont(fontName, text, style, opts = {}) {
   const kind = isMono ? 'mono' : isSerif ? 'serif' : 'sans';
   const script = isKorean ? 'ko' : 'lat';
 
-  const scored = SYSTEM_FONTS.map((f) => {
+  // Pretendard short-circuit for unrecognisable Korean fonts. When the PDF
+  // embedded a custom face whose name pdfjs reports as a subset alias
+  // ("g_d0_f1") or some other opaque identifier — i.e. no alias hit AND no
+  // recognisable trait keyword in the name — we still need to pick SOMETHING
+  // sensible. Pretendard covers modern Korean PDFs visually well and is the
+  // user's stated default ("내재된 폰트 내 파악 불가한 폰트의 경우 프리텐다드"),
+  // so return it directly, upgrading to Bold when the weight signal said so.
+  const nameLooksOpaque =
+    !raw ||
+    /^g_d\d+_f\d+$/i.test(raw) ||
+    /^[a-z]\d/i.test(raw) ||
+    !/[a-z]{3,}/i.test(raw);
+  if (isKorean && kind === 'sans' && nameLooksOpaque) {
+    const pretendardName = weight >= 700 ? 'Pretendard Bold'
+      : weight >= 600 ? 'Pretendard SemiBold'
+      : weight >= 500 ? 'Pretendard Medium'
+      : 'Pretendard';
+    const hit = SYSTEM_FONTS.find((f) => f.name === pretendardName);
+    if (hit) return { font: hit, weight: hit.weight };
+  }
+
+  const scored = SYSTEM_FONTS.map((f, idx) => {
     let s = 0;
     if (f.kind === kind) s += 6;
     else if (kind === 'sans' && f.kind === 'serif') s -= 4;
@@ -783,14 +880,21 @@ export function matchPdfFont(fontName, text, style, opts = {}) {
     else if (script === 'ko' && f.script === 'lat') s -= 8; // Latin font on Korean text would tofu
     const wd = Math.abs((f.weight || 400) - weight);
     s += Math.max(0, 4 - Math.round(wd / 100));
-    return { f, s };
-  }).sort((a, b) => b.s - a.s);
+    // Korean-sans body-text canonical bias — same logic as findFont. Makes
+    // Pretendard the default for unrecognised Korean PDF font names so the
+    // page renders with one consistent face instead of switching between
+    // visually-similar-but-not-identical Korean sans across layers.
+    if (script === 'ko' && kind === 'sans' && /^Pretendard($| )/i.test(f.name)) s += 3;
+    return { f, s, idx };
+  }).sort((a, b) => (b.s - a.s) || (a.idx - b.idx));
 
   let pool = scored.slice(0, 6).map((x) => x.f);
 
   // 3) Width calibration — pick the top scorer whose rendered text width
   //    is closest to the source. This is what keeps Korean layout intact:
   //    even small per-glyph width differences add up across a long line.
+  //    A tolerance band keeps a clearly-better-named candidate from being
+  //    rejected over a sub-pixel width win by a worse-named one.
   if (opts.originalWidthPx && opts.fontSizePx && text) {
     const ctx = getMeasureCtx();
     let best = pool[0], bestDelta = Infinity;
@@ -803,12 +907,12 @@ export function matchPdfFont(fontName, text, style, opts = {}) {
     return { font: best, weight: best.weight };
   }
 
-  // Diversification: among the top heuristic candidates, round-robin on
-  // text hash so two different lines with identical Korean-sans-400 scores
-  // don't BOTH resolve to Pretendard. Each line gets a stable but distinct
-  // pick (Pretendard / SUIT / Noto / Nanum / IBM Plex / Gothic A1 …).
-  const tieKey = Math.abs(hashStr(text));
-  return { font: pool[tieKey % pool.length], weight: pool[0].weight };
+  // No width data → return the single highest-scoring candidate. The old
+  // tieKey round-robin (intended to "diversify" away from everything
+  // being Pretendard) actively made the page look inconsistent post-edit
+  // because two body-text lines with identical Korean-sans-400 scores
+  // landed on DIFFERENT faces. Stable picks are what the user wants.
+  return { font: pool[0], weight: pool[0].weight };
 }
 
 let _measureCtx = null;
