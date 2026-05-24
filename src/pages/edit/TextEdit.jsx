@@ -1597,7 +1597,16 @@ function canMerge(a, b) {
   if (a.isVertical || b.isVertical) return false;
   if (a.angleDeg || b.angleDeg) return false;
   if (a.fontFamily !== b.fontFamily) return false;
-  if (a.fontWeight !== b.fontWeight) return false;
+  // fontWeight差: deliberately NOT a merge-blocker. A common case is a
+  // single visual sentence whose middle fragment is bolder (e.g.
+  // "● 식권대장 감소(-87)의 **63%가 검색광고**(-55)…"). PDF emits the
+  // bold fragment as a separate item with a different weight; if we
+  // refused to merge it, the line ends up split into 3 layers (the
+  // exact "한 줄이 잘려서 인식되는" complaint). The merged layer takes
+  // the LEFT fragment's weight; rendering after edit therefore loses
+  // the per-word bold styling, but the user can re-apply bold to
+  // sub-words via the B button if needed. Keeping the line unified is
+  // the stated priority.
   if (Math.abs((a.fontSize || 0) - (b.fontSize || 0)) > 1) return false;
   const baseA = a.baseY ?? a.y + a.h;
   const baseB = b.baseY ?? b.y + b.h;
@@ -1909,32 +1918,33 @@ function renderEdits(ctx, p, editingLayerId) {
     if (l.deleted || l.edited || l.visible === false) continue;
     if (!l.moved) continue;
     // Lift the original glyph pixels and place them at the new position.
-    // Same source/dest dimensions = no scaling = no metric drift. Source
-    // rect uses the PIXEL-TIGHT extent so the lifted bitmap contains the
-    // glyph and nothing else (no partial neighbour cell content), plus a
-    // small ±LIFT_PAD vertical margin. Without that pad the Korean final
-    // consonants (ㄱ/ㄴ/ㅁ/ㅂ) which sit right at glyphBottom lost their
-    // last 1–2 px on move ("식" → "신", "분" → "부" in the bug screenshot),
-    // because the pixel-tight scan in `tightenBBoxToGlyphs` already crops
-    // to the visible ink and any sub-pixel anti-aliasing on the edge can
-    // fall outside the cropped rect.
-    const LIFT_PAD = 2;
-    const sx = l.originalX ?? l.x;
-    const sw = l.originalW ?? l.w;
+    // Source rect = pixel-tight extent + a generous LIFT_PAD on ALL sides.
+    // The pad has to cover:
+    //   • Korean final consonants (ㄱ/ㄴ/ㅁ/ㅂ) whose ink sits exactly at
+    //     glyphBottom — sub-pixel anti-aliasing on that edge falls outside
+    //     the pixel-tight rect from tightenBBoxToGlyphs and is lost on
+    //     drawImage ("식"→"신", "분"→"부" bug);
+    //   • bold-face glyphs whose side-bearing extends past originalX/W;
+    //   • the diacritic-like Korean glyph parts (ㅑ ㅕ ㅛ) that ride
+    //     slightly above the baseline cluster.
+    // 2 px was insufficient; 6 px covers worst-case anti-aliased tails at
+    // 2× canvas scaling without dragging in adjacent row text.
+    const LIFT_PAD = 6;
+    const rawSx   = l.originalX ?? l.x;
+    const rawSw   = l.originalW ?? l.w;
     const rawSy   = (l.glyphTop    != null ? l.glyphTop    : (l.originalY ?? l.y));
     const rawSBot = (l.glyphBottom != null ? l.glyphBottom : ((l.originalY ?? l.y) + (l.originalH ?? l.h)));
+    const sx = Math.max(0, rawSx - LIFT_PAD);
+    const sw = Math.min(src.width - sx, (rawSx + rawSw) - sx + LIFT_PAD);
     const sy = Math.max(0, rawSy - LIFT_PAD);
     const sBot = Math.min(src.height, rawSBot + LIFT_PAD);
     const sh = Math.max(1, sBot - sy);
-    // Translate destination Y so the glyph baseline lifts to the new
-    // line-box's baseline (l.y is the line-box top after move). Aligns
-    // the moved glyph with the rest of the layer's geometry. Computed
-    // against `sy` (post-pad), so the destination y shifts up by the
-    // same LIFT_PAD that the source rect expanded — the extra padding
-    // pixels land just above the new line-box top, never clipping the
-    // glyph itself.
-    const dy = (l.y + (sy - (l.originalY ?? l.y)));
-    ctx.drawImage(src, sx, sy, sw, sh, l.x, dy, sw, sh);
+    // Destination shifts by the same pad so the lifted glyph ink lands
+    // EXACTLY at the new line-box top (the extra padding pixels just
+    // extend past the box invisibly). dx/dy = new_box_corner − pad.
+    const dx = l.x + (sx - rawSx);
+    const dy = l.y + (sy - (l.originalY ?? l.y));
+    ctx.drawImage(src, sx, sy, sw, sh, dx, dy, sw, sh);
   }
   for (const l of p.layers) {
     if (l.deleted || !l.edited || l.visible === false) continue;

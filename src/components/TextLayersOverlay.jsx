@@ -453,14 +453,16 @@ function LayerBoxRaw({ layer: l, offsetX, offsetY, scale, isSelected, isEditing,
               whiteSpace: 'nowrap',
               border: 'none',
               outline: 'none',
-              // OPAQUE while editing — covers the original glyphs on the
-              // canvas beneath so the user only sees their own text. Without
-              // this the canvas's pre-edit rendering bleeds through the
-              // transparent input and the typed text looks doubled / shifted
-              // on top of the old one (the "텍스트 수정 시 뒤에 문구 앞에
-              // 덮어지는" issue). Default to the layer's sampled background
-              // (or white) when the user hasn't explicitly chosen one.
-              background: (l.bgColorEdited && l.bgColor) ? l.bgColor : (l.bgColor || '#ffffff'),
+              // Background: TRANSPARENT by default (user-stated rule —
+              // "텍스트 제외 텍스트 배경은 무조건 투명으로 적용"). The original
+              // glyphs are wiped from the canvas underneath by renderEdits()
+              // using the layer's sampled bgColor before the input mounts,
+              // so a transparent input doesn't expose the pre-edit text —
+              // the user sees their typed glyphs on top of the sampled
+              // page-background patch (cell colour for table text, white
+              // for body text). Only paint a solid colour when the user has
+              // EXPLICITLY chosen one via the background-colour picker.
+              background: (l.bgColorEdited && l.bgColor) ? l.bgColor : 'transparent',
               color: l.color || '#111111',
               fontSize: displayFontSize,
               // line-height 1 keeps the input baseline predictable — see the
