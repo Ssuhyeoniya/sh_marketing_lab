@@ -41,11 +41,24 @@ export default function TextLayersOverlay({
   // HTML overlay box shows the new position via CSS in real time; the canvas
   // is re-rasterised once on drag end.
   onDragActiveChange,
+  // Called when the inline text editor opens / closes. Parent uses the id to
+  // suppress canvas text rendering for the editing layer — otherwise the
+  // <input> and the canvas paint the SAME glyphs at slightly different
+  // baselines / metrics, producing the visible double / "overlap" artefact.
+  onEditingChange,
 }) {
   const [drag, setDrag] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [editingCaret, setEditingCaret] = useState(null); // [start, end] selection on focus
   const [areaDrag, setAreaDrag] = useState(null); // for delete-area mode
+
+  // Notify parent of edit-mode transitions. Wrapped in an effect so we don't
+  // call back during render. Parent passes the id straight through to
+  // `renderEdits`, which uses it to (a) erase the original glyph footprint
+  // immediately on edit open (so the user can see only their edits, never the
+  // pre-edit text peeking through) and (b) skip the canvas text draw for the
+  // editing layer, leaving the inline <input> as the sole renderer.
+  useEffect(() => { onEditingChange?.(editingId); }, [editingId, onEditingChange]);
 
   // Latest layers in a ref so stable callbacks can resolve a layer by id
   // without invalidating their identity on every render.
@@ -356,8 +369,17 @@ function LayerBoxRaw({ layer: l, offsetX, offsetY, scale, isSelected, isEditing,
   }, [isEditing, caretRange]);
 
   const displayFontSize = (+l.fontSize || 14) * scale;
+  // Align the editor's baseline to the EXACT baseline drawTextOverlay uses on
+  // the canvas. Canvas draw: baseY = l.baseY (fallback l.y + l.ascent). We
+  // position the input so its text baseline lands on the same screen-Y. With
+  // line-height = 1 the input's baseline sits at ~78 % of its box height for
+  // most Latin fonts (and a touch lower for Korean) — close enough to the
+  // canvas baseline that the rendered text doesn't visually jump on commit.
   const lineH = displayFontSize;
-  const baselineNudge = Math.max(0, (h - lineH) / 2);
+  const layerAscentPx = (l.ascent != null ? l.ascent : (+l.fontSize || 14) * 0.84) * scale;
+  // Input top (in box-local coords): baseY_screen - ascent_metric.
+  // baseY_screen = ascent in box-local coords; input ascent ≈ lineH * 0.78.
+  const inputTopWithinBox = Math.max(0, layerAscentPx - lineH * 0.78);
   const PAD = 3;
 
   let border, bg;
@@ -425,19 +447,25 @@ function LayerBoxRaw({ layer: l, offsetX, offsetY, scale, isSelected, isEditing,
             style={{
               position: 'absolute',
               left: PAD,
-              top: PAD + baselineNudge,
+              top: PAD + inputTopWithinBox,
               width: `calc(100% - ${PAD * 2}px)`,
               height: `${lineH}px`,
               whiteSpace: 'nowrap',
               border: 'none',
               outline: 'none',
-              // Transparent by default — only paint a solid background
-              // when the user has explicitly chosen one (matches the
-              // canvas-side rule in drawTextOverlay).
-              background: l.bgColorEdited && l.bgColor ? l.bgColor : 'transparent',
+              // OPAQUE while editing — covers the original glyphs on the
+              // canvas beneath so the user only sees their own text. Without
+              // this the canvas's pre-edit rendering bleeds through the
+              // transparent input and the typed text looks doubled / shifted
+              // on top of the old one (the "텍스트 수정 시 뒤에 문구 앞에
+              // 덮어지는" issue). Default to the layer's sampled background
+              // (or white) when the user hasn't explicitly chosen one.
+              background: (l.bgColorEdited && l.bgColor) ? l.bgColor : (l.bgColor || '#ffffff'),
               color: l.color || '#111111',
               fontSize: displayFontSize,
-              lineHeight: `${lineH}px`,
+              // line-height 1 keeps the input baseline predictable — see the
+              // `inputTopWithinBox` calculation above for the alignment math.
+              lineHeight: 1,
               fontFamily: l.fontFamily,
               fontWeight: l.fontWeight,
               letterSpacing: l.letterSpacing ? `${l.letterSpacing * scale}px` : 0,
