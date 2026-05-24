@@ -1606,17 +1606,16 @@ function canMerge(a, b) {
   // numeric label is never the start of a Korean sentence, so a hard rule
   // is safe.
   if (/^\d{1,3}[.)]?$/.test(aText)) return false;
-  // x-ordering: b must sit to the right of a, with a gap small enough to be
-  // an in-sentence spacer. Threshold = 0.7 em — large enough to cover the
-  // 1-em full-width Korean word-space that occasionally appears mid-phrase,
-  // small enough to NOT bridge the typical table cell-padding gap (usually
-  // ≥ 1 em on each side of the column rule, so ≥ 2 em centre-to-edge).
-  // The previous 1.2-em threshold reliably joined cross-cell runs whose
-  // padding sat right at the cell rule, which is what caused row 4's "4"
-  // to merge into "프리미엄 원두 …".
+  // x-ordering: b must sit to the right of a, with a gap small enough to
+  // be an in-sentence spacer. Back at 1.2 em — the previous tighter 0.7-em
+  // value split single Korean sentences (full-width word-space ≈ 1 em)
+  // into 3+ layers, the "한 줄 문장이 3개 영역으로 잡힘" regression. The
+  // standalone-numeric guard above already catches the row-number column
+  // case (the "4" + "프리미엄 원두 …" merge), so we don't also need a
+  // tighter gap.
   const gap = b.x - (a.x + a.w);
   if (gap < -2) return false;             // overlapping → don't touch
-  if (gap > fz * 0.7) return false;       // too far apart
+  if (gap > fz * 1.2) return false;       // too far apart
   return true;
 }
 
@@ -1894,16 +1893,29 @@ function renderEdits(ctx, p, editingLayerId) {
     // Lift the original glyph pixels and place them at the new position.
     // Same source/dest dimensions = no scaling = no metric drift. Source
     // rect uses the PIXEL-TIGHT extent so the lifted bitmap contains the
-    // glyph and nothing else (no partial neighbour cell content).
+    // glyph and nothing else (no partial neighbour cell content), plus a
+    // small ±LIFT_PAD vertical margin. Without that pad the Korean final
+    // consonants (ㄱ/ㄴ/ㅁ/ㅂ) which sit right at glyphBottom lost their
+    // last 1–2 px on move ("식" → "신", "분" → "부" in the bug screenshot),
+    // because the pixel-tight scan in `tightenBBoxToGlyphs` already crops
+    // to the visible ink and any sub-pixel anti-aliasing on the edge can
+    // fall outside the cropped rect.
+    const LIFT_PAD = 2;
     const sx = l.originalX ?? l.x;
     const sw = l.originalW ?? l.w;
-    const sy = (l.glyphTop != null ? l.glyphTop : (l.originalY ?? l.y));
-    const sBot = (l.glyphBottom != null ? l.glyphBottom : ((l.originalY ?? l.y) + (l.originalH ?? l.h)));
+    const rawSy   = (l.glyphTop    != null ? l.glyphTop    : (l.originalY ?? l.y));
+    const rawSBot = (l.glyphBottom != null ? l.glyphBottom : ((l.originalY ?? l.y) + (l.originalH ?? l.h)));
+    const sy = Math.max(0, rawSy - LIFT_PAD);
+    const sBot = Math.min(src.height, rawSBot + LIFT_PAD);
     const sh = Math.max(1, sBot - sy);
     // Translate destination Y so the glyph baseline lifts to the new
     // line-box's baseline (l.y is the line-box top after move). Aligns
-    // the moved glyph with the rest of the layer's geometry.
-    const dy = (l.y + ((sy - (l.originalY ?? l.y)) || 0));
+    // the moved glyph with the rest of the layer's geometry. Computed
+    // against `sy` (post-pad), so the destination y shifts up by the
+    // same LIFT_PAD that the source rect expanded — the extra padding
+    // pixels land just above the new line-box top, never clipping the
+    // glyph itself.
+    const dy = (l.y + (sy - (l.originalY ?? l.y)));
     ctx.drawImage(src, sx, sy, sw, sh, l.x, dy, sw, sh);
   }
   for (const l of p.layers) {
