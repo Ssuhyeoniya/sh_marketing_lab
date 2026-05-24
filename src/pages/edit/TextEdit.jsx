@@ -232,6 +232,14 @@ export default function TextEdit() {
     const page = pages[pageIdx];
     if (!page) return;
 
+    // Diagnostic: which path was taken? PDF text path has garble filtering;
+    // OCR fallback path does not. If 'no garble log' AND 'using OCR path'
+    // → the garbled layer must come from elsewhere (e.g. Tesseract output).
+    const _pdfItems = page.pdfText?.items?.length || 0;
+    console.log(
+      `[TextEdit] runOcrForPage page=${page.pageNum} path=${_pdfItems ? 'PDF-text' : 'OCR-fallback'} pdfItems=${_pdfItems} pdfTextPresent=${!!page.pdfText}`
+    );
+
     // If we have a native PDF text layer, use it — exact positions, font size
     // and baselines straight from the PDF. No raster OCR, no heuristics.
     if (page.pdfText && page.pdfText.items && page.pdfText.items.length) {
@@ -798,6 +806,14 @@ export default function TextEdit() {
     // glyphs + invisible ActualText overlay create two layers per visual
     // text), then run the sentence-merge pass on the survivors.
     const mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
+    // Diagnostic: show OCR-path layer texts so we can see whether the
+    // garbled "ATE/EES" is coming from Tesseract output (= page is on
+    // the OCR fallback path, so Issue #26 A's PDF-side filter doesn't
+    // apply and we need a different fix).
+    console.log(
+      `[TextEdit] OCR-fallback produced ${mergedLayers.length} layers on page ${page.pageNum}`,
+      mergedLayers.slice(0, 30).map((l) => l.text)
+    );
     setPages((ps) => ps.map((p, i) => (i === pageIdx ? { ...p, layers: mergedLayers, ocrDone: true } : p)));
   };
 
