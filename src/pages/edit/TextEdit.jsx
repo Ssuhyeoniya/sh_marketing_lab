@@ -1620,10 +1620,18 @@ function canMerge(a, b) {
   const aText = (a.text || '').trim();
   const bText = (b.text || '').trim();
   if (/[.!?。]$/.test(aText) || /(다|요)\.$/.test(aText)) return false;
-  // Parenthetical-label guard. "(VAT포함)" sitting next to a regular run
-  // should stay its own layer — the user wants per-label selection.
-  if (/^[(（[].+[)）\]]\s*$/.test(bText)) return false;
-  if (/^[(（[].+[)）\]]\s*$/.test(aText)) return false;
+  // Parenthetical-LABEL guard. "(VAT포함)" / "(주식회사)" / "(SAMPLE)" —
+  // a label sitting next to a regular run that should stay its own
+  // editable layer. The OLD broad guard (anything in parens) blocked
+  // legitimate inline stat references like "(-55)" / "(-58)" / "(-39)"
+  // that PDF emits as separate items, splitting the line "63%가 검색
+  // 광고(-55), 복지대장 감소(-58)" into 3+ layers. Narrowed: only block
+  // when the parenthetical content is PURE Korean OR PURE uppercase
+  // Latin (label patterns) — never when it contains digits / minus /
+  // lowercase (stat patterns).
+  const isLabelParen = (s) => /^[(（[][가-힣A-Z]+[)）\]]\s*$/.test(s);
+  if (isLabelParen(bText)) return false;
+  if (isLabelParen(aText)) return false;
   // Table-cell guard — refuse to merge a standalone short number/token with
   // the next run. In tabular layouts the "No" / index column is emitted as
   // a tiny item ("1", "4", "11") that sits one cell-gap away from the
@@ -1868,13 +1876,36 @@ function splitOcrLineByCells(line) {
 //   4. Paint user-drawn area-erase rectangles last so they always win.
 function renderEdits(ctx, p, editingLayerId) {
   const src = p.canvas;
+  // Find the editing layer up-front so we can also wipe any OTHER layer
+  // whose bbox visually overlaps it. Without this, a duplicate that
+  // dedupOverlappingLayers didn't catch (slightly offset ActualText
+  // overlay, etc.) keeps drawing its glyphs straight through the
+  // transparent <input>, producing the "수정 시 텍스트가 덮어지는"
+  // artefact even though the editing-layer's own draw is correctly
+  // skipped.
+  const editingLayer = editingLayerId ? p.layers.find((x) => x.id === editingLayerId) : null;
+  const overlapsEditing = (l) => {
+    if (!editingLayer || l.id === editingLayer.id) return false;
+    const ax0 = editingLayer.x, ay0 = editingLayer.y;
+    const ax1 = ax0 + editingLayer.w, ay1 = ay0 + editingLayer.h;
+    const bx0 = l.x, by0 = l.y;
+    const bx1 = bx0 + l.w, by1 = by0 + l.h;
+    const ix0 = Math.max(ax0, bx0), iy0 = Math.max(ay0, by0);
+    const ix1 = Math.min(ax1, bx1), iy1 = Math.min(ay1, by1);
+    if (ix1 <= ix0 || iy1 <= iy0) return false;
+    const inter = (ix1 - ix0) * (iy1 - iy0);
+    const aArea = Math.max(1, editingLayer.w * editingLayer.h);
+    const bArea = Math.max(1, l.w * l.h);
+    return inter / Math.min(aArea, bArea) > 0.30;
+  };
   for (const l of p.layers) {
     // Editing layer ALWAYS gets erased — even before the first keystroke —
     // so the user never sees the canvas-rendered original peeking through
-    // the opaque <input>. Without this, opening the editor briefly shows
-    // the old glyphs underneath until `l.edited` flips true on first input.
+    // the <input>. The same rule also covers any layer that visually
+    // overlaps the editing one (dedup leftovers, ActualText overlays).
     const isEditing = editingLayerId && l.id === editingLayerId;
-    const needsErase = l.deleted || l.edited || (l.moved && !l.deleted) || isEditing;
+    const isEditingOverlap = overlapsEditing(l);
+    const needsErase = l.deleted || l.edited || (l.moved && !l.deleted) || isEditing || isEditingOverlap;
     if (!needsErase) continue;
     // Erase rect = UNION of (original glyph footprint) ∪ (new draw extent)
     // with generous padding. Previous versions used only the pixel-tight
@@ -1927,9 +1958,11 @@ function renderEdits(ctx, p, editingLayerId) {
     //   • bold-face glyphs whose side-bearing extends past originalX/W;
     //   • the diacritic-like Korean glyph parts (ㅑ ㅕ ㅛ) that ride
     //     slightly above the baseline cluster.
-    // 2 px was insufficient; 6 px covers worst-case anti-aliased tails at
-    // 2× canvas scaling without dragging in adjacent row text.
-    const LIFT_PAD = 6;
+    // Pad scales with font size — fixed 6 px was enough for body text
+    // but not for 80-px+ bold titles where anti-aliased tails span 10+
+    // pixels. Formula: max(8, 0.2 × fontSize) caps small layers at 8 px
+    // and gives bigger headlines proportionally more room.
+    const LIFT_PAD = Math.max(8, Math.round((l.fontSize || 14) * 0.20));
     const rawSx   = l.originalX ?? l.x;
     const rawSw   = l.originalW ?? l.w;
     const rawSy   = (l.glyphTop    != null ? l.glyphTop    : (l.originalY ?? l.y));
@@ -1948,13 +1981,14 @@ function renderEdits(ctx, p, editingLayerId) {
   }
   for (const l of p.layers) {
     if (l.deleted || !l.edited || l.visible === false) continue;
-    // Skip the editing layer — its inline <input> is the sole renderer
-    // while the editor is open. Drawing here too produces a doubled
-    // overlap (canvas glyphs behind input glyphs at a slightly different
-    // baseline, the visible artefact from issues #1 & #2). On commit,
+    // Skip the editing layer + any layer overlapping it. The inline
+    // <input> is the sole renderer for that region while the editor is
+    // open; drawing here too produces a doubled overlap (canvas glyphs
+    // behind input glyphs at a slightly different baseline). On commit
     // editingLayerId clears, scheduleRedraw fires, and the canvas takes
-    // over the rendering cleanly.
+    // over rendering cleanly.
     if (editingLayerId && l.id === editingLayerId) continue;
+    if (overlapsEditing(l)) continue;
     drawTextOverlay(ctx, l);
   }
   for (const r of (p.eraseRegions || [])) {
