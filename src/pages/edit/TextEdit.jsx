@@ -13,6 +13,18 @@ import ConfirmDialog from '../../components/ConfirmDialog';
 
 const FONT_OPTIONS = SYSTEM_FONTS;
 
+// Issue #26 A — module-load marker. Prints once when this JS chunk
+// is first evaluated. If you don't see this line in devtools console
+// when the text-edit page is open, the browser is serving a CACHED
+// bundle and any code changes here aren't actually running.
+console.log(
+  '%c[TextEdit] module loaded · build=' +
+  (import.meta.env.VITE_COMMIT_SHA || 'dev').slice(0, 7) +
+  ' · branch=' + (import.meta.env.VITE_BRANCH || 'local') +
+  ' · garble-v2 (sub-token scan)',
+  'color: white; background: #2563eb; padding: 2px 6px; border-radius: 3px;'
+);
+
 export default function TextEdit() {
   // pages: [{ id, name, canvas, layers, ocrDone }]
   const [pages, setPages] = useState([]);
