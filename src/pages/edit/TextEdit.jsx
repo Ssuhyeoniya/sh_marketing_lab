@@ -805,11 +805,68 @@ export default function TextEdit() {
     // Dedup duplicate / overlapping layers FIRST (PDFs that emit visible
     // glyphs + invisible ActualText overlay create two layers per visual
     // text), then run the sentence-merge pass on the survivors.
-    const mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
-    // Diagnostic: show OCR-path layer texts so we can see whether the
-    // garbled "ATE/EES" is coming from Tesseract output (= page is on
-    // the OCR fallback path, so Issue #26 A's PDF-side filter doesn't
-    // apply and we need a different fix).
+    let mergedLayers = mergeAdjacentLayers(dedupOverlappingLayers(layers));
+    // ── Issue #26 A · OCR-path garble filter ─────────────────────────────
+    // When the PDF has no extractable text layer (image-only PDFs, scans,
+    // or pages where pdfjs returned zero items), the rendered bitmap goes
+    // through Tesseract. Tesseract occasionally misclassifies short
+    // Korean glyph clusters as Latin acronyms ("원두는" → "ATE",
+    // "택배출고" → "EES") — same visual garble pattern as the PDF-text
+    // PUA fallback, just produced by a different stage. We apply the
+    // same final-pass filter here so the user doesn't get a nonsense
+    // editable layer on top of clean rendered text.
+    //
+    // Page-level context is computed across the OCR layers themselves
+    // (not from a PDF text layer that doesn't exist on this path).
+    {
+      const _OCR_ALLOWED = new Set([
+        'AI', 'AR', 'VR', 'IT', 'OS', 'PC', 'TV', 'PD', 'CD', 'DVD', 'USB',
+        'HD', 'FHD', 'UHD', '4K', '8K', 'OK', 'PDF', 'JPG', 'PNG', 'GIF',
+        'CEO', 'CTO', 'CFO', 'API', 'SDK', 'SUV', 'GPS', 'LED', 'LCD',
+        'OLED', 'IOS', 'IOT', 'SSD', 'HDD', 'CPU', 'GPU', 'RAM', 'ROM',
+        'MP3', 'MP4', 'KBS', 'MBC', 'SBS', 'YTN', 'JTBC', 'NASA', 'NATO',
+        'IMF', 'UN', 'WHO', 'CCTV', 'KTX', 'SRT', 'BTS', 'SK', 'LG', 'KT',
+        'GS', 'CJ', 'SM', 'YG', 'JYP', 'BMW', 'KIA', 'EV', 'VAT', 'NO',
+      ]);
+      const _OCR_SPLIT = /[\s,.()[\]{}<>"'/\\:;!?·•|\-_*]+/;
+      const _isStandaloneOcrGarble = (t) => {
+        const s = t.replace(/[\s.,()*·•\-_:]+/g, '');
+        return /^[A-Z]{2,4}$/.test(s) && !_OCR_ALLOWED.has(s);
+      };
+      const _hasEmbeddedOcrGarble = (t) => {
+        for (const st of t.split(_OCR_SPLIT)) {
+          if (!st) continue;
+          if (/^[A-Z]{2,4}$/.test(st) && !_OCR_ALLOWED.has(st)) return true;
+        }
+        return false;
+      };
+      let hangulChars = 0, totalChars = 0;
+      for (const l of mergedLayers) {
+        const t = (l.text || '').trim();
+        totalChars += t.length;
+        hangulChars += (t.match(/[가-힣]/g) || []).length;
+      }
+      const isKoreanPage = totalChars > 0 && hangulChars / totalChars > 0.2;
+      const beforeCount = mergedLayers.length;
+      const dropped = [];
+      if (isKoreanPage) {
+        mergedLayers = mergedLayers.filter((l) => {
+          const t = (l.text || '').trim();
+          if (!t) return false;
+          if (looksGarbledKorean(t)) { dropped.push(t); return false; }
+          if (_isStandaloneOcrGarble(t)) { dropped.push(t); return false; }
+          if (_hasEmbeddedOcrGarble(t)) { dropped.push(t); return false; }
+          return true;
+        });
+      }
+      console.log(
+        `[TextEdit] Issue #26 A OCR-path garble analysis page=${page.pageNum} ` +
+        `totalChars=${totalChars} hangulChars=${hangulChars} ` +
+        `hangulRatio=${totalChars ? (hangulChars / totalChars).toFixed(3) : 0} ` +
+        `isKoreanPage=${isKoreanPage} dropped=${beforeCount - mergedLayers.length}/${beforeCount}`,
+        dropped.length ? { droppedTexts: dropped } : ''
+      );
+    }
     console.log(
       `[TextEdit] OCR-fallback produced ${mergedLayers.length} layers on page ${page.pageNum}`,
       mergedLayers.slice(0, 30).map((l) => l.text)
