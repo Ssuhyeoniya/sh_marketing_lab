@@ -848,24 +848,65 @@ export default function TextEdit() {
       }
       const isKoreanPage = totalChars > 0 && hangulChars / totalChars > 0.2;
       const beforeCount = mergedLayers.length;
-      const dropped = [];
+      const dropped = [];   // fully removed (pure noise — no bbox kept)
+      const blanked = [];   // text cleared but bbox preserved for manual entry
       if (isKoreanPage) {
-        mergedLayers = mergedLayers.filter((l) => {
+        mergedLayers = mergedLayers.reduce((acc, l) => {
           const t = (l.text || '').trim();
-          if (!t) return false;
-          if (looksGarbledKorean(t)) { dropped.push(t); return false; }
-          if (_isStandaloneOcrGarble(t)) { dropped.push(t); return false; }
-          if (_hasEmbeddedOcrGarble(t)) { dropped.push(t); return false; }
-          return true;
-        });
+          if (!t) { acc.push(l); return acc; }
+          // Pure standalone garble (a layer whose ENTIRE content is one
+          // short uppercase Latin token like "EES") — no useful bbox
+          // either, drop entirely.
+          if (_isStandaloneOcrGarble(t)) { dropped.push(t); return acc; }
+          // Mixed garble (Korean line with embedded Latin nonsense from
+          // Tesseract — "* ATE 2개월 단위 EES 됩니다."). The bbox covers
+          // a real visible row, so we keep the geometry but blank the
+          // text. The user clicks the (now empty) layer and types in
+          // the correct content directly.
+          const isGarble = looksGarbledKorean(t) || _hasEmbeddedOcrGarble(t);
+          if (isGarble) {
+            blanked.push(t);
+            acc.push({ ...l, text: '', originalText: '', words: [] });
+            return acc;
+          }
+          acc.push(l);
+          return acc;
+        }, []);
       }
       console.log(
         `[TextEdit] Issue #26 A OCR-path garble analysis page=${page.pageNum} ` +
         `totalChars=${totalChars} hangulChars=${hangulChars} ` +
         `hangulRatio=${totalChars ? (hangulChars / totalChars).toFixed(3) : 0} ` +
-        `isKoreanPage=${isKoreanPage} dropped=${beforeCount - mergedLayers.length}/${beforeCount}`,
-        dropped.length ? { droppedTexts: dropped } : ''
+        `isKoreanPage=${isKoreanPage} ` +
+        `dropped=${dropped.length} blanked=${blanked.length} kept=${mergedLayers.length}/${beforeCount}`,
+        { droppedTexts: dropped, blankedTexts: blanked }
       );
+      // Self-audit: after the filter, look for survivors that LOOK like
+      // garble we should have caught. Helps pin down exactly which layer
+      // text shape is bypassing the current rules.
+      const survivedGarble = mergedLayers.filter((l) => {
+        const t = (l.text || '').trim();
+        if (!t) return false;
+        // Heuristic: any layer text containing an uppercase Latin run of
+        // 2+ chars AND ≥ 1 Hangul char OR a standalone short uppercase
+        // word — same surface pattern we want to drop.
+        if (/[A-Z]{2,}/.test(t) && /[가-힣]/.test(t)) return true;
+        if (/^[A-Z]{2,4}$/.test(t.replace(/[\s.,()*·•\-_:]+/g, ''))) return true;
+        return false;
+      });
+      if (survivedGarble.length) {
+        console.warn(
+          `[TextEdit] Issue #26 A · ${survivedGarble.length} garble-shaped layer(s) STILL PRESENT after filter on page ${page.pageNum}:`,
+          survivedGarble.map((l) => ({
+            text: l.text,
+            looksGarbledKorean: looksGarbledKorean(l.text),
+            isStandalone: _isStandaloneOcrGarble(l.text),
+            hasEmbedded: _hasEmbeddedOcrGarble(l.text),
+            tokens: (l.text || '').split(_OCR_SPLIT).filter(Boolean),
+            hangulCount: ((l.text || '').match(/[가-힣]/g) || []).length,
+          }))
+        );
+      }
     }
     console.log(
       `[TextEdit] OCR-fallback produced ${mergedLayers.length} layers on page ${page.pageNum}`,
