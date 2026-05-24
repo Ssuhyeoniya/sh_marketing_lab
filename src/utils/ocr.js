@@ -569,6 +569,72 @@ function hashStr(s) {
   return h;
 }
 
+// Stroke-width bold detector. Works off the rendered page bitmap so it's
+// independent of font-name signals — important for PDF text items whose
+// embedded font name doesn't include the word "Bold" but whose glyphs
+// are visually bold (the common case for custom corporate fonts).
+//
+// For each scan line in the bbox, finds runs of dark pixels (stroke
+// crossings) and takes the median run length. Median stroke width /
+// glyph height is a robust bold signal across scripts — Korean glyphs
+// naturally have more strokes than Latin so a flat density threshold
+// would over-trigger; per-row stroke width is invariant to complexity.
+//
+// Returns { isBold, isUltra, strokeRatio }. strokeRatio is 0 when the
+// bbox is degenerate or the canvas read fails — caller can treat that
+// as "no signal" and fall back to font-name heuristics.
+export function detectBoldByStroke(canvas, bbox, isKorean) {
+  if (!canvas || !bbox) return { isBold: false, isUltra: false, strokeRatio: 0 };
+  try {
+    const ctx = canvas.getContext('2d');
+    const x0 = Math.max(0, Math.floor(bbox.x0));
+    const y0 = Math.max(0, Math.floor(bbox.y0));
+    const x1 = Math.min(canvas.width, Math.ceil(bbox.x1));
+    const y1 = Math.min(canvas.height, Math.ceil(bbox.y1));
+    const width = x1 - x0;
+    const height = y1 - y0;
+    if (width < 6 || height < 6) return { isBold: false, isUltra: false, strokeRatio: 0 };
+    const w = Math.min(width, 240);
+    const h = Math.min(height, 80);
+    const data = ctx.getImageData(x0, y0, w, h).data;
+    const rowStrokes = [];
+    for (let y = 0; y < h; y++) {
+      const rowStart = y * w * 4;
+      let lumSum = 0;
+      for (let x = 0; x < w; x++) {
+        const i = rowStart + x * 4;
+        lumSum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      }
+      const rowMean = lumSum / w;
+      const thr = Math.min(160, rowMean - 30);
+      const runs = [];
+      let runLen = 0;
+      for (let x = 0; x < w; x++) {
+        const i = rowStart + x * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum < thr) runLen++;
+        else if (runLen > 0) { runs.push(runLen); runLen = 0; }
+      }
+      if (runLen > 0) runs.push(runLen);
+      if (runs.length) rowStrokes.push(median(runs));
+    }
+    if (rowStrokes.length < 4) return { isBold: false, isUltra: false, strokeRatio: 0 };
+    const stroke = median(rowStrokes);
+    const ratio = stroke / h;
+    // Empirical thresholds (same as guessFont): Korean naturally has
+    // thicker strokes so the bold threshold sits slightly higher.
+    const boldThreshold = isKorean ? 0.130 : 0.110;
+    return {
+      isBold: ratio > boldThreshold,
+      isUltra: ratio > 0.20,
+      strokeRatio: ratio,
+    };
+  } catch {
+    return { isBold: false, isUltra: false, strokeRatio: 0 };
+  }
+}
+
+
 // Font matcher using Tesseract word metadata when present, plus stroke-width
 // fallback for bold detection. Returns { font, size, weight, isBold, isItalic }.
 export function guessFont(word, imageCanvas) {
@@ -784,6 +850,27 @@ export function matchPdfFont(fontName, text, style, opts = {}) {
   const weight = isBold ? 700 : isLight ? 300 : 400;
   const kind = isMono ? 'mono' : isSerif ? 'serif' : 'sans';
   const script = isKorean ? 'ko' : 'lat';
+
+  // Pretendard short-circuit for unrecognisable Korean fonts. When the PDF
+  // embedded a custom face whose name pdfjs reports as a subset alias
+  // ("g_d0_f1") or some other opaque identifier — i.e. no alias hit AND no
+  // recognisable trait keyword in the name — we still need to pick SOMETHING
+  // sensible. Pretendard covers modern Korean PDFs visually well and is the
+  // user's stated default ("내재된 폰트 내 파악 불가한 폰트의 경우 프리텐다드"),
+  // so return it directly, upgrading to Bold when the weight signal said so.
+  const nameLooksOpaque =
+    !raw ||
+    /^g_d\d+_f\d+$/i.test(raw) ||
+    /^[a-z]\d/i.test(raw) ||
+    !/[a-z]{3,}/i.test(raw);
+  if (isKorean && kind === 'sans' && nameLooksOpaque) {
+    const pretendardName = weight >= 700 ? 'Pretendard Bold'
+      : weight >= 600 ? 'Pretendard SemiBold'
+      : weight >= 500 ? 'Pretendard Medium'
+      : 'Pretendard';
+    const hit = SYSTEM_FONTS.find((f) => f.name === pretendardName);
+    if (hit) return { font: hit, weight: hit.weight };
+  }
 
   const scored = SYSTEM_FONTS.map((f, idx) => {
     let s = 0;

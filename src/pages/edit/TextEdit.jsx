@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 import DropZone from '../../components/DropZone';
 import { loadImage, fileToDataURL, canvasToBlob } from '../../utils/image';
-import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText, preprocessForOcr, assessPdfTextQuality, looksGarbledKorean } from '../../utils/ocr';
+import { recognizeImage, guessFont, matchPdfFont, buildFontFamilyChain, suppressTableLines, tightenBBoxToGlyphs, detectVerticalText, preprocessForOcr, assessPdfTextQuality, looksGarbledKorean, detectBoldByStroke } from '../../utils/ocr';
 import { loadPdfJs, renderPageToCanvas, downloadBlob, extractPageTextItems } from '../../utils/pdf';
 import { PDFDocument } from 'pdf-lib';
 import { useFontsReady } from '../../utils/fonts';
@@ -428,6 +428,16 @@ export default function TextEdit() {
           // Vertical text flag — tall, narrow cells with multiple glyphs.
           const isVertical = detectVerticalText(page.canvas, bbox, it.text);
           const isKorean = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(it.text);
+          // Stroke-width bold detection against the rendered bitmap. The PDF
+          // text path otherwise relies entirely on the embedded font name
+          // (matchPdfFont) and matrix weight to decide bold — when the PDF
+          // embedded a custom corporate font whose name doesn't contain
+          // "Bold" / "Black" / "Heavy" (very common for unrecognised faces
+          // that fall through to generic Pretendard mapping), visually bold
+          // text rendered as Regular. Bitmap-stroke analysis is independent
+          // of the font name and catches those cases. The result also feeds
+          // into the matched weight upgrade below.
+          const boldByStroke = detectBoldByStroke(page.canvas, bbox, isKorean);
           // Family chain: matched web font → Korean OS fallbacks → generic.
           //
           // We deliberately DO NOT prepend the pdfjs-registered family
@@ -518,11 +528,19 @@ export default function TextEdit() {
             fontFamily,
             fontName: m.font.name,
             fontSize: it.fontSize,
-            fontWeight: m.weight,
-            // PDF source: bold/italic is inferred from the font name and the
-            // matrix shear we already extracted. Stored on the layer so the
-            // right-panel B / I toggles and the re-render path agree.
-            isBold: m.weight >= 600 || /bold|black|heavy|semibold|demi/i.test(it.fontName),
+            // Final weight = max(matched weight, bitmap-detected weight). If
+            // the rendered glyphs are visually bold (stroke ratio > thresh)
+            // but the embedded font name didn't say so, bump to 700 (or 900
+            // for ultra). This is what makes "볼드 처리된 텍스트 인식" work
+            // for PDFs whose corporate font has a neutral name.
+            fontWeight: Math.max(
+              m.weight,
+              boldByStroke.isUltra ? 900 : (boldByStroke.isBold ? 700 : 0)
+            ),
+            isBold:
+              m.weight >= 600 ||
+              /bold|black|heavy|semibold|demi/i.test(it.fontName) ||
+              boldByStroke.isBold,
             isItalic: !!it.skewXDeg || /italic|oblique/i.test(it.fontName),
             color: fg,
             bgColor: bg,
